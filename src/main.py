@@ -1,0 +1,509 @@
+"""PyQt6 version of the betting EV viewer (converted from Tkinter).
+
+Key conversions:
+ - Tk widgets -> PyQt6 widgets
+ - Treeview -> QTableWidget
+ - after() scheduling -> QThread/QTimer
+ - Matplotlib embedding via FigureCanvasQTAgg
+"""
+
+from __future__ import annotations
+
+import sys, os
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QAction, QColor, QIcon
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
+    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar
+)
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+
+# Ensure project root is in sys.path so we can import from src
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+try:
+    import src.theme_manager as theme_manager
+except ModuleNotFoundError:
+    # Fallback if running directly from src without package context
+    import theme_manager as theme_manager
+
+load_dotenv()
+
+JSON_KEYFILE = "my-matchbettings-ev-script-878cbe8fa582.json"
+SPREADSHEET_NAME = "Match betting"
+DEFAULT_SHEET = "Each Unique Odds"
+COL_RANGE = "F2:M"  # Extended to include new bet count columns L (Live) & M (Not Live)
+SPORTS = ["CS2", "Valorant", "R6S", "COD", "LOL", "Dota 2", "Basketball", "Tennis", "Ice Hockey"]
+
+# RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
+RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
+
+
+@dataclass
+class SheetCacheEntry:
+    rows: List[RowTuple]
+    # index maps odds -> (live_wr, prem_wr, live_cnt, prem_cnt)
+    index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]]
+
+
+def resource_path(name: str) -> str:
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))  # type: ignore[attr-defined]
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+def parse_wr(s: str) -> Optional[float]:
+    if not s or s.strip() == "":
+        return None
+    try:
+        x = float(s.replace("%", "").strip())
+        return x / 100.0 if x > 1 else x
+    except Exception:
+        return None
+
+
+def parse_count(s: str) -> Optional[int]:
+    if not s or s.strip() == "":
+        return None
+    try:
+        return int(float(s.strip()))
+    except Exception:
+        return None
+
+
+def round_odds_key(v) -> Optional[float]:
+    try:
+        return round(float(v), 4)
+    except Exception:
+        return None
+
+
+def fmt_wr(wr: Optional[float]) -> str:
+    return "N/A" if wr is None else f"{wr*100:.2f}%"
+
+
+def fmt_ev(wr: Optional[float], odds: Optional[float]):
+    if wr is None or odds is None:
+        return "N/A", None
+    ev = (wr * odds) - 1.0
+    return f"{ev*100:.2f}%", ev
+
+
+def authorize_client():
+    # Try to get credentials from environment variable first
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.exists(env_path):
+        path = env_path
+    else:
+        path = resource_path(JSON_KEYFILE)
+
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
+    return gspread.authorize(creds)
+
+
+def fetch_sheet_data(spreadsheet, sheet_name: str) -> SheetCacheEntry:
+    ws = spreadsheet.worksheet(sheet_name)
+    try:
+        raw = ws.get(COL_RANGE)
+    except Exception:
+        raw = ws.batch_get([COL_RANGE])[0]
+    rows: List[RowTuple] = []
+    index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
+    for r in raw:
+        # Need at least 8 columns (F..M). Pad if shorter for backward compatibility.
+        if len(r) < 8:
+            r = r + [""] * (8 - len(r))
+        odds_s, _legacy_cnt, _c2, _c3, live_wr_s, prem_wr_s, live_cnt_s, prem_cnt_s = r[:8]
+        odds_s = (odds_s or '').strip()
+        if not odds_s:
+            continue
+        try:
+            odds = float(odds_s.replace('%',''))
+        except ValueError:
+            continue
+        live_wr = parse_wr(live_wr_s)
+        prem_wr = parse_wr(prem_wr_s)
+        live_cnt = parse_count(live_cnt_s)
+        prem_cnt = parse_count(prem_cnt_s)
+        tup: RowTuple = (odds, live_wr, prem_wr, live_cnt, prem_cnt)
+        rows.append(tup)
+        k = round_odds_key(odds)
+        if k is not None and k not in index:
+            index[k] = (live_wr, prem_wr, live_cnt, prem_cnt)
+    return SheetCacheEntry(rows, index)
+
+
+class PreloadWorker(QObject):
+    progress = pyqtSignal(str)
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+    def __init__(self, spreadsheet, sports: List[str]):
+        super().__init__()
+        self.spreadsheet = spreadsheet
+        self.sports = sports
+        self.cache: Dict[str, SheetCacheEntry] = {}
+    def run(self):
+        try:
+            total = len(self.sports)
+            for i, s in enumerate(self.sports):
+                self.progress.emit(f"Loading {s}... ({i+1}/{total})")
+                self.status.emit(f"Fetching data for {s}")
+                try:
+                    self.cache[s] = fetch_sheet_data(self.spreadsheet, s)
+                    self.status.emit(f"Loaded {len(self.cache[s].rows)} records for {s}")
+                except Exception as e:
+                    self.status.emit(f"Error loading {s}: {e}")
+            self.progress.emit("Preparing statistics...")
+            self.status.emit("Priming charts")
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class RefreshWorker(QObject):
+    finished = pyqtSignal(bool, str, object)
+    def __init__(self, spreadsheet, sheet_name: str):
+        super().__init__()
+        self.spreadsheet = spreadsheet
+        self.sheet_name = sheet_name
+    def run(self):
+        try:
+            entry = fetch_sheet_data(self.spreadsheet, self.sheet_name)
+            self.finished.emit(True, self.sheet_name, entry)
+        except Exception as e:
+            self.finished.emit(False, str(e), None)
+
+
+class PreloadDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Loading Data...")
+        self.setFixedSize(420, 240)
+        lay = QVBoxLayout(self)
+        self.lbl_title = QLabel("Loading Betting Data")
+        self.lbl_title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.lbl_title.setStyleSheet("font-size:18px;font-weight:bold;")
+        lay.addWidget(self.lbl_title)
+        self.lbl_progress = QLabel("Initializing...")
+        lay.addWidget(self.lbl_progress)
+        self.bar = QProgressBar(); self.bar.setRange(0,0); lay.addWidget(self.bar)
+        self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)
+        lay.addWidget(self.lbl_status)
+    def update_progress(self, t: str): self.lbl_progress.setText(t)
+    def update_status(self, t: str): self.lbl_status.setText(t)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, spreadsheet):
+        super().__init__()
+        self.spreadsheet = spreadsheet
+        self.setWindowTitle("Google Sheets Bet EV Viewer")
+        self.resize(1200, 800)
+        self.data_cache: Dict[str, SheetCacheEntry] = {}
+        self.current_rows: List[RowTuple] = []
+        self.odds_index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
+        self.dark_mode = True
+        self.current_view = "table"  # Track current view: "table" or "statistics"
+        self._build_ui()
+        self._connect()
+        theme_manager.apply_theme(QApplication.instance(), dark=self.dark_mode)
+        self.btn_theme.setChecked(True)
+        self.btn_theme.setText(" Light Mode")
+
+    # UI
+    def _build_ui(self):
+        # Central widget and root layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QHBoxLayout(central)
+
+        # --- Sidebar (Controls) ---
+        sidebar = QWidget(); sidebar.setObjectName("Sidebar"); sidebar.setFixedWidth(280)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(10, 10, 10, 10)
+        sidebar_layout.setSpacing(10)
+        root_layout.addWidget(sidebar)
+
+        # Sport and Bet Type selectors
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("Sport:"))
+        self.sport_combo = QComboBox(); self.sport_combo.addItems(SPORTS); controls_layout.addWidget(self.sport_combo)
+        controls_layout.addWidget(QLabel("Bet Type:"))
+        self.bettype_combo = QComboBox(); self.bettype_combo.addItems(["Live", "Not Live"]); controls_layout.addWidget(self.bettype_combo)
+        sidebar_layout.addLayout(controls_layout)
+
+        # Comparison GroupBox
+        self.compare_group = QGroupBox("Comparison")
+        cg = QVBoxLayout(self.compare_group)
+        odds_a_layout = QHBoxLayout(); odds_a_layout.addWidget(QLabel("Odds A:")); self.entry_odds_a = QLineEdit(); odds_a_layout.addWidget(self.entry_odds_a); cg.addLayout(odds_a_layout)
+        odds_b_layout = QHBoxLayout(); odds_b_layout.addWidget(QLabel("Odds B:")); self.entry_odds_b = QLineEdit(); odds_b_layout.addWidget(self.entry_odds_b); cg.addLayout(odds_b_layout)
+        self.btn_compare = QPushButton("Compare"); cg.addWidget(self.btn_compare)
+        sidebar_layout.addWidget(self.compare_group)
+        
+        # Statistics Button
+        self.btn_statistics = QPushButton("Statistics")
+        sidebar_layout.addWidget(self.btn_statistics)
+        
+        # Data Table Button
+        self.btn_data_table = QPushButton("Data Table")
+        sidebar_layout.addWidget(self.btn_data_table)
+        
+        sidebar_layout.addStretch(1)
+
+        # Bottom buttons
+        self.btn_refresh = QPushButton(" Force Refresh"); self.btn_refresh.setIcon(QIcon(resource_path("icons/refresh-cw.svg"))); sidebar_layout.addWidget(self.btn_refresh)
+        self.btn_theme = QPushButton(" Dark Mode"); self.btn_theme.setIcon(QIcon(resource_path("icons/sun.svg"))); self.btn_theme.setCheckable(True); self.btn_theme.setToolTip("Toggle Dark / Light theme"); sidebar_layout.addWidget(self.btn_theme)
+
+        # --- Main Content (Results) ---
+        main_content = QWidget(); main_layout = QVBoxLayout(main_content); main_layout.setContentsMargins(10, 10, 10, 0); root_layout.addWidget(main_content, 1)
+
+        # Comparison Result Card
+        compare_card = QGroupBox(); compare_card.setObjectName("CompareCard"); card_layout = QVBoxLayout(compare_card)
+        self.compare_result = QLabel("Enter two odds above and click Compare."); self.compare_result.setWordWrap(True); self.compare_result.setAlignment(Qt.AlignmentFlag.AlignCenter); self.compare_result.setMinimumHeight(80); card_layout.addWidget(self.compare_result); main_layout.addWidget(compare_card)
+
+        # Data Table
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Odds", "Live WR %", "Prematch WR %", "EV %"])
+        # Stretch last column (EV %) to fill remaining space
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        main_layout.addWidget(self.table, 1)
+        
+        # Statistics Panel (initially hidden)
+        self.statistics_panel = QWidget()
+        statistics_layout = QVBoxLayout(self.statistics_panel)
+        statistics_layout.setContentsMargins(10, 10, 10, 10)
+        # Empty panel for now
+        placeholder_label = QLabel("Statistics panel - coming soon")
+        placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder_label.setStyleSheet("font-size: 16px; color: gray;")
+        statistics_layout.addWidget(placeholder_label)
+        main_layout.addWidget(self.statistics_panel, 1)
+        self.statistics_panel.hide()  # Start hidden
+
+        # --- Status Bar & Menu ---
+        self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar); self.set_status("Ready")
+        act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close); self.menuBar().addAction(act_exit)
+
+    def _connect(self):
+        self.btn_refresh.clicked.connect(lambda: self.refresh_data(force=True))
+        self.btn_compare.clicked.connect(self.compare_by_odds)
+        self.sport_combo.currentTextChanged.connect(self.on_sport_change)
+        self.bettype_combo.currentTextChanged.connect(self.on_bet_type_change)
+        self.entry_odds_a.textChanged.connect(self.recompute_comparison_inline)
+        self.entry_odds_b.textChanged.connect(self.recompute_comparison_inline)
+        self.btn_theme.toggled.connect(self.on_theme_toggled)
+        self.btn_statistics.clicked.connect(self.show_statistics_panel)
+        self.btn_data_table.clicked.connect(self.show_data_table_panel)
+
+    # Helpers
+    def set_status(self, text: str): self.status_bar.showMessage(text)
+    def set_controls_enabled(self, enabled: bool):
+        for w in [self.sport_combo,self.bettype_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
+            w.setEnabled(enabled)
+
+    # Data
+    def get_data_for_sheet(self, sheet: str, force: bool=False) -> SheetCacheEntry:
+        if not force and sheet in self.data_cache: return self.data_cache[sheet]
+        entry = fetch_sheet_data(self.spreadsheet, sheet); self.data_cache[sheet] = entry; return entry
+
+    def fill_table(self, rows: List[RowTuple], bet_type: str):
+        self.table.setRowCount(0)
+        # Fetch theme colors from application properties (with fallbacks)
+        app = QApplication.instance()
+        from PyQt6.QtGui import QColor as _QColor  # local alias to avoid confusion
+        pos = app.property("positiveColor") if app else None
+        neg = app.property("negativeColor") if app else None
+        neu = app.property("neutralColor") if app else None
+        if not isinstance(pos, _QColor): pos = _QColor('green')
+        if not isinstance(neg, _QColor): neg = _QColor('red')
+        if not isinstance(neu, _QColor): neu = _QColor('gray')
+        for odds, live_wr, prem_wr, _live_cnt, _prem_cnt in rows:
+            wr = live_wr if bet_type=="Live" else prem_wr
+            ev_str, ev_val = fmt_ev(wr, odds)
+            r = self.table.rowCount(); self.table.insertRow(r)
+            cells = [f"{odds:.2f}", fmt_wr(live_wr), fmt_wr(prem_wr), ev_str]
+            for c, txt in enumerate(cells):
+                it = QTableWidgetItem(txt); it.setTextAlignment(Qt.AlignmentFlag.AlignCenter); self.table.setItem(r,c,it)
+            color = neu if wr is None else pos if ev_val and ev_val>0 else neg
+            for c in range(4): self.table.item(r,c).setForeground(color)
+
+    def update_ev_only(self):
+        bt = self.bettype_combo.currentText()
+        # Fetch theme colors (same logic as fill_table)
+        app = QApplication.instance()
+        from PyQt6.QtGui import QColor as _QColor
+        pos = app.property("positiveColor") if app else None
+        neg = app.property("negativeColor") if app else None
+        neu = app.property("neutralColor") if app else None
+        if not isinstance(pos, _QColor): pos = _QColor('green')
+        if not isinstance(neg, _QColor): neg = _QColor('red')
+        if not isinstance(neu, _QColor): neu = _QColor('gray')
+        for r in range(self.table.rowCount()):
+            odds = float(self.table.item(r,0).text())
+            def parse_cell(s:str):
+                if s in ("","N/A"): return None
+                return float(s.rstrip('%'))/100.0
+            live_wr = parse_cell(self.table.item(r,1).text())
+            prem_wr = parse_cell(self.table.item(r,2).text())
+            wr = live_wr if bt=="Live" else prem_wr
+            ev_str, ev_val = fmt_ev(wr, odds)
+            self.table.item(r,3).setText(ev_str)
+            color = neu if wr is None else pos if ev_val and ev_val>0 else neg
+            for c in range(4): self.table.item(r,c).setForeground(color)
+        self.recompute_comparison_inline()
+
+    # Comparison
+    def render_compare(self, odds_a, odds_b, wr_a, wr_b, ev_a, ev_b, sport, bet_type, count_a, count_b):
+        label_type = 'Live' if bet_type=='Live' else 'Prematch'
+        if wr_a is None and wr_b is None:
+            self.compare_result.setText(f"Both odds are missing {label_type} WR data: {odds_a:.2f} and {odds_b:.2f}."); return
+        if wr_a is None or wr_b is None:
+            present_odds = odds_b if wr_a is None else odds_a
+            present_wr = wr_b if wr_a is None else wr_a
+            present_ev = ev_b if wr_a is None else ev_a
+            present_count = count_b if wr_a is None else count_a
+            missing_odds = odds_a if wr_a is None else odds_b
+            cnt = 'N/A' if present_count is None else str(present_count)
+            self.compare_result.setText(
+                f"Odds {missing_odds:.2f} is missing {label_type} WR. Showing available bet only (no comparison).\n\n"
+                f"Bet {present_odds:.2f} EV: {present_ev*100:.2f}% (WR: {present_wr*100:.2f}%, Count: {cnt})")
+            return
+        score_a, score_b = wr_a*odds_a, wr_b*odds_b
+        if score_a>score_b: better=f"Bet {odds_a:.2f} is better"
+        elif score_b>score_a: better=f"Bet {odds_b:.2f} is better"
+        else: better="Both bets are equal"
+        ca = 'N/A' if count_a is None else str(count_a); cb = 'N/A' if count_b is None else str(count_b)
+        txt=(f"{better} ({bet_type} - {sport})\n\n"+
+             f"Bet {odds_a:.2f} EV: {ev_a*100:.2f}% (WR: {wr_a*100:.2f}%, Count: {ca})\n"+
+             f"Bet {odds_b:.2f} EV: {ev_b*100:.2f}% (WR: {wr_b*100:.2f}%, Count: {cb})")
+        notes=[]
+        if count_a==1: notes.append(f"Note: Odds {odds_a:.2f} has only 1 count.")
+        if count_b==1: notes.append(f"Note: Odds {odds_b:.2f} has only 1 count.")
+        if notes: txt += "\n\n"+" ".join(notes)
+        self.compare_result.setText(txt)
+
+    def recompute_comparison_inline(self):
+        try:
+            odds_a = float(self.entry_odds_a.text().strip()); odds_b = float(self.entry_odds_b.text().strip())
+        except ValueError:
+            self.compare_result.setText(""); return
+        bet_type = self.bettype_combo.currentText()
+        k_a, k_b = round_odds_key(odds_a), round_odds_key(odds_b)
+        miss_a = k_a not in self.odds_index; miss_b = k_b not in self.odds_index
+        if miss_a and miss_b:
+            self.compare_result.setText(f"Both odds not found in data: {odds_a:.2f} and {odds_b:.2f}."); return
+        if miss_a or miss_b:
+            pk = k_b if miss_a else k_a; po = odds_b if miss_a else odds_a
+            wr_live, wr_pre, live_cnt, prem_cnt = self.odds_index[pk]
+            wr_p = wr_live if bet_type=="Live" else wr_pre
+            cnt_p = live_cnt if bet_type=="Live" else prem_cnt
+            if wr_p is None:
+                self.compare_result.setText((f"Odd {odds_a:.2f} not found. " if miss_a else f"Odd {odds_b:.2f} not found. ")+f"Odds {po:.2f} is in data but missing {bet_type} WR."); return
+            ev_p = (wr_p*po)-1.0; cnt_s='N/A' if cnt_p is None else str(cnt_p)
+            missing = f"Odd {odds_a:.2f} not found." if miss_a else f"Odd {odds_b:.2f} not found."
+            self.compare_result.setText(f"{missing} Showing available bet only (no comparison).\n\nBet {po:.2f} EV: {ev_p*100:.2f}% (WR: {wr_p*100:.2f}%, Count: {cnt_s})")
+            return
+        wr_a_live, wr_a_pre, live_cnt_a, prem_cnt_a = self.odds_index[k_a]; wr_b_live, wr_b_pre, live_cnt_b, prem_cnt_b = self.odds_index[k_b]
+        wr_a = wr_a_live if bet_type=="Live" else wr_a_pre; wr_b = wr_b_live if bet_type=="Live" else wr_b_pre
+        ev_a = None if wr_a is None else (wr_a*odds_a)-1.0; ev_b = None if wr_b is None else (wr_b*odds_b)-1.0
+        cnt_a = live_cnt_a if bet_type=="Live" else prem_cnt_a
+        cnt_b = live_cnt_b if bet_type=="Live" else prem_cnt_b
+        self.render_compare(odds_a, odds_b, wr_a, wr_b, ev_a, ev_b, self.sport_combo.currentText(), bet_type, cnt_a, cnt_b)
+
+    def compare_by_odds(self): self.recompute_comparison_inline()
+    def on_bet_type_change(self): self.update_ev_only()
+    def on_sport_change(self): self.refresh_data(False)
+
+    def on_theme_toggled(self, checked: bool):
+        self.dark_mode = checked
+        theme_manager.apply_theme(QApplication.instance(), dark=checked)
+        self.btn_theme.setText(" Light Mode" if checked else " Dark Mode")
+        self.btn_theme.setIcon(QIcon(resource_path("icons/moon.svg" if checked else "icons/sun.svg")))
+
+    def show_statistics_panel(self):
+        """Switch to statistics panel view"""
+        self.current_view = "statistics"
+        self.table.hide()
+        self.statistics_panel.show()
+
+    def show_data_table_panel(self):
+        """Switch to data table view"""
+        self.current_view = "table"
+        self.statistics_panel.hide()
+        self.table.show()
+
+    def refresh_data(self, force: bool=False):
+        sheet = self.sport_combo.currentText() or DEFAULT_SHEET
+        # If we already have this sheet cached and not forcing, use cache instantly
+        if not force and sheet in self.data_cache:
+            entry = self.data_cache[sheet]
+            self.current_rows = entry.rows
+            self.odds_index = entry.index
+            self.fill_table(self.current_rows, self.bettype_combo.currentText())
+            self.recompute_comparison_inline()
+            self.setWindowTitle(f"Google Sheets Bet EV Viewer - {sheet}")
+            self.set_status("Loaded from cache")
+            return
+        # Otherwise perform an async refresh from Google Sheets
+        self.set_status(f"Loading {sheet} (fetching)..."); self.set_controls_enabled(False)
+        t=QThread(); w=RefreshWorker(self.spreadsheet, sheet); w.moveToThread(t)
+        t.started.connect(w.run)
+        w.finished.connect(lambda ok, info, entry: self._on_refresh_done(t,w,ok,info,entry))
+        t.start()
+
+    def _on_refresh_done(self, thread: QThread, worker: RefreshWorker, ok: bool, info: str, entry: Optional[SheetCacheEntry]):
+        thread.quit(); thread.wait(); worker.deleteLater()
+        if ok and entry:
+            self.data_cache[info]=entry; self.current_rows=entry.rows; self.odds_index=entry.index
+            self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.setWindowTitle(f"Google Sheets Bet EV Viewer - {info}")
+            self.recompute_comparison_inline()
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to load data: {info}")
+        self.set_controls_enabled(True); self.set_status("Ready")
+
+    def set_initial_cache(self, cache: Dict[str, SheetCacheEntry]):
+        self.data_cache.update(cache)
+        first = self.sport_combo.currentText() or DEFAULT_SHEET
+        if first in self.data_cache:
+            entry = self.data_cache[first]
+            self.current_rows=entry.rows; self.odds_index=entry.index
+            self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.recompute_comparison_inline()
+
+
+def main():
+    app = QApplication(sys.argv)
+    try:
+        client = authorize_client(); spreadsheet = client.open(SPREADSHEET_NAME)
+    except Exception as e:
+        QMessageBox.critical(None, "Startup Error", f"Failed to initialize Google Sheets: {e}"); return 1
+    win = MainWindow(spreadsheet)
+    dlg = PreloadDialog(); preload_thread = QThread(); worker = PreloadWorker(spreadsheet, SPORTS); worker.moveToThread(preload_thread)
+    preload_thread.started.connect(worker.run)
+    worker.progress.connect(dlg.update_progress); worker.status.connect(dlg.update_status)
+    def done(ok: bool, msg: str):
+        preload_thread.quit(); preload_thread.wait(); worker.deleteLater(); dlg.accept()
+        if not ok:
+            QMessageBox.critical(win, "Preload Failed", f"Failed to preload data:\n{msg}"); win.close(); return
+        win.set_initial_cache(worker.cache); win.show()
+    worker.finished.connect(done)
+    QTimer.singleShot(60000, lambda: done(False, "Preloading timed out") if preload_thread.isRunning() else None)
+    preload_thread.start(); dlg.exec()
+    return app.exec()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

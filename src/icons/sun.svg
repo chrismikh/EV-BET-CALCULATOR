@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 16 16" id="sun">
+  <defs>
+    <path id="d" d="M0,0h0.999893v2.49973h-0.999893Z"></path>
+    <path id="b" d="M0,0h2.5v1h-2.5Z"></path>
+    <path id="a" d="M0,0h1v2.5h-1Z"></path>
+    <path id="c" d="M0,0h2.49973v0.999893h-2.49973Z"></path>
+  </defs>
+  <path d="M8.12132,1.75736c1.75736,1.75736 1.75736,4.6066 0,6.36396c-1.75736,1.75736 -4.6066,1.75736 -6.36396,0c-1.75736,-1.75736 -1.75736,-4.6066 -8.88178e-16,-6.36396c1.75736,-1.75736 4.6066,-1.75736 6.36396,-8.88178e-16" transform="translate(3.06 3.06)"></path>
+  <use xlink:href="#a" transform="translate(7.5)"></use>
+  <use xlink:href="#a" transform="translate(7.5 13.5)"></use>
+  <use xlink:href="#b" transform="translate(13.5 7.5)"></use>
+  <use xlink:href="#b" transform="translate(0 7.5)"></use>
+  <use xlink:href="#c" transform="rotate(-45 10.303 -12.046)"></use>
+  <use xlink:href="#c" transform="rotate(-45 17.053 4.25)"></use>
+  <use xlink:href="#d" transform="rotate(-45 20.546 -7.803)"></use>
+  <use xlink:href="#d" transform="rotate(-45 4.25 -1.053)"></use>
+</svg>

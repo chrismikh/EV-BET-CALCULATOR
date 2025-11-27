@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# Google credentials
+service-account.json
+credentials.json
+*.pem
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Virtual env
+venv/
+
+# json files
+*.json
