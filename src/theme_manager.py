@@ -1,8 +1,7 @@
-"""Theme manager for light and dark modes.
+#Theme manager for light and dark modes.
+#apply_theme(app, dark=True/False) sets palette + stylesheet + matplotlib rcParams
+#for future figures. Statistics panel rebuild triggers new styling for plots.
 
-apply_theme(app, dark=True/False) sets palette + stylesheet + matplotlib rcParams
-for future figures. Statistics panel rebuild triggers new styling for plots.
-"""
 
 from __future__ import annotations
 

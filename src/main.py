@@ -1,24 +1,16 @@
-"""PyQt6 version of the betting EV viewer (converted from Tkinter).
-
-Key conversions:
- - Tk widgets -> PyQt6 widgets
- - Treeview -> QTableWidget
- - after() scheduling -> QThread/QTimer
- - Matplotlib embedding via FigureCanvasQTAgg
-"""
-
 from __future__ import annotations
 
-import sys, os
+import sys, os, re, time
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+from collections import Counter
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
-    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar
+    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar, QHeaderView
 )
 
 import gspread
@@ -39,11 +31,15 @@ load_dotenv()
 JSON_KEYFILE = "my-matchbettings-ev-script-878cbe8fa582.json"
 SPREADSHEET_NAME = "Match betting"
 DEFAULT_SHEET = "Each Unique Odds"
-COL_RANGE = "F2:M"  # Extended to include new bet count columns L (Live) & M (Not Live)
+COL_RANGE = "F2:M" 
 SPORTS = ["CS2", "Valorant", "R6S", "COD", "LOL", "Dota 2", "Basketball", "Tennis", "Ice Hockey"]
+
+MATCHBET_SHEET_NAME = "MATCHBET"
+MATCHBET_COL_RANGE = "B2:D"
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
+MatchBetTuple = Tuple[str, str, str]
 
 
 @dataclass
@@ -111,6 +107,65 @@ def authorize_client():
     return gspread.authorize(creds)
 
 
+def normalize_tournament_name(name: str) -> str:
+    """
+    Normalizes tournament names by removing years, seasons, and specific suffixes
+    to group variations of the same event.
+    """
+    if not name:
+        return ""
+
+    # Specific fix for StarLadder abbreviations
+    name = name.replace("StarLadder SS", "StarLadder StarSeries")
+
+    # 1. Remove text after colons or double slashes (e.g., "BLAST: CQ" -> "BLAST", "Galaxy Battle // Phase 4" -> "Galaxy Battle")
+    if '//' in name:
+        name = name.split('//')[0]
+    if ': ' in name:
+        name = name.split(': ')[0]
+
+    # 2. Remove years (1990-2029)
+    # Matches 4 digits starting with 19 or 20 surrounded by word boundaries
+    name = re.sub(r'\b(19|20)\d{2}\b', '', name)
+
+    # 3. Remove common sequential patterns (Case insensitive)
+    # "Season 19", "Series 5", "Vol. 2", "Part 1", "#12", "Stage 1", "Phase 2", "Split 1", "Group A"
+    patterns = [
+        r'\bSeason\s+\d+\b',
+        r'\bSeries\s+\d+\b',
+        r'\bVol\.?\s*\d+\b',
+        r'\bPart\s+\d+\b',
+        r'\bStage\s+\d+\b',
+        r'\bPhase\s+\d+\b',
+        r'\bSplit\s+\d+\b',
+        r'\bGroup\s+[A-Za-z0-9]+\b',
+        r'#\d+',
+        r'\bOS\b',
+        r'\b(Asia|Americas|Europe)\s+RMR(\s+[A-Z])?\b',
+        r'\bRMR\b',
+        r'\bS\d+\b',
+        r'(?<!^)\b(Europe|EU|NA|SA|Asia|Americas|Oceania|CIS|European|South American|North American|Pacific|APAC)\b',
+        r'\bLCQ\b',
+        r'\b(Play-In|Global Finals|Contenders|CQ|Finals?|Groups?|Playoffs?)\b',
+        r'\bSeries\b',
+        r'(?<!^)(?<!\bIEM\s)\b(Atlanta|Katowice|Bangkok|Raleigh)\b',
+        r'\b(Spring|Summer|Fall|Winter)\b',
+        r'\b(I|II|III|IV|V|VI|VII|VIII|IX|X)\b'
+    ]
+    for pattern in patterns:
+        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
+
+    # 4. Remove standalone numbers (1-3 digits) that might be season/edition numbers
+    # e.g. "ESL Pro League 21" -> "ESL Pro League", "UFC 302" -> "UFC"
+    name = re.sub(r'\b\d{1,3}\b', '', name)
+
+    # 5. Clean up extra whitespace and trailing hyphens
+    # Replace multiple spaces with single space and trim ends
+    name = re.sub(r'\s+', ' ', name).strip(' -')
+
+    return name
+
+
 def fetch_sheet_data(spreadsheet, sheet_name: str) -> SheetCacheEntry:
     ws = spreadsheet.worksheet(sheet_name)
     try:
@@ -142,6 +197,35 @@ def fetch_sheet_data(spreadsheet, sheet_name: str) -> SheetCacheEntry:
             index[k] = (live_wr, prem_wr, live_cnt, prem_cnt)
     return SheetCacheEntry(rows, index)
 
+def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
+    try:
+        ws = spreadsheet.worksheet(MATCHBET_SHEET_NAME)
+        try:
+            raw = ws.get(MATCHBET_COL_RANGE)
+        except Exception:
+            raw = ws.batch_get([MATCHBET_COL_RANGE])[0]
+        
+        data: List[MatchBetTuple] = []
+        for r in raw:
+            # We expect 3 columns: Tournament (B), Matchup (C), Bet (D)
+            # Pad if shorter
+            if len(r) < 3:
+                r = r + [""] * (3 - len(r))
+            
+            tournament = r[0].strip()
+            matchup = r[1].strip()
+            bet = r[2].strip()
+            
+            # Skip empty rows if necessary
+            if not tournament and not matchup and not bet:
+                continue
+                
+            data.append((tournament, matchup, bet))
+        return data
+    except Exception as e:
+        print(f"Error fetching matchbet data: {e}")
+        return []
+
 
 class PreloadWorker(QObject):
     progress = pyqtSignal(str)
@@ -152,6 +236,8 @@ class PreloadWorker(QObject):
         self.spreadsheet = spreadsheet
         self.sports = sports
         self.cache: Dict[str, SheetCacheEntry] = {}
+        self.matchbet_data: List[MatchBetTuple] = []
+
     def run(self):
         try:
             total = len(self.sports)
@@ -163,6 +249,13 @@ class PreloadWorker(QObject):
                     self.status.emit(f"Loaded {len(self.cache[s].rows)} records for {s}")
                 except Exception as e:
                     self.status.emit(f"Error loading {s}: {e}")
+            
+            # Fetch MATCHBET data
+            self.progress.emit("Loading Match Bets...")
+            self.status.emit("Fetching MATCHBET sheet")
+            self.matchbet_data = fetch_matchbet_data(self.spreadsheet)
+            self.status.emit(f"Loaded {len(self.matchbet_data)} match bets")
+
             self.progress.emit("Preparing statistics...")
             self.status.emit("Priming charts")
             self.finished.emit(True, "")
@@ -211,6 +304,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Google Sheets Bet EV Viewer")
         self.resize(1200, 800)
         self.data_cache: Dict[str, SheetCacheEntry] = {}
+        self.matchbet_data: List[MatchBetTuple] = []
         self.current_rows: List[RowTuple] = []
         self.odds_index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
         self.dark_mode = True
@@ -439,6 +533,55 @@ class MainWindow(QMainWindow):
         self.current_view = "statistics"
         self.table.hide()
         self.statistics_panel.show()
+        
+        # Clear existing layout
+        layout = self.statistics_panel.layout()
+        if layout is None:
+            layout = QVBoxLayout(self.statistics_panel)
+            self.statistics_panel.setLayout(layout)
+        
+        # Remove existing widgets in layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        # --- Container 1: Tournament Statistics ---
+        tournament_group = QGroupBox("Tournament Statistics")
+        t_layout = QVBoxLayout(tournament_group)
+
+        # Calculate stats with normalization
+        tournaments = [normalize_tournament_name(t[0]) for t in self.matchbet_data if t[0]] # Filter empty tournament names
+        counts = Counter(tournaments)
+        
+        # Create table
+        stats_table = QTableWidget(len(counts), 2)
+        stats_table.setHorizontalHeaderLabels(["Tournament", "Bet Count"])
+        stats_table.horizontalHeader().setStretchLastSection(False)
+        stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        stats_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        stats_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        stats_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        
+        # Sort by count descending
+        sorted_counts = counts.most_common()
+        
+        for r, (tourney, count) in enumerate(sorted_counts):
+            t_item = QTableWidgetItem(tourney)
+            c_item = QTableWidgetItem(str(count))
+            c_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            stats_table.setItem(r, 0, t_item)
+            stats_table.setItem(r, 1, c_item)
+            
+        t_layout.addWidget(QLabel(f"Total Bets: {len(self.matchbet_data)}"))
+        t_layout.addWidget(stats_table)
+
+        # Add container to main layout
+        layout.addWidget(tournament_group)
+        
+        # Add stretch to push everything up
+        layout.addStretch()
 
     def show_data_table_panel(self):
         """Switch to data table view"""
@@ -483,13 +626,33 @@ class MainWindow(QMainWindow):
             self.current_rows=entry.rows; self.odds_index=entry.index
             self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.recompute_comparison_inline()
 
+    def set_matchbet_data(self, data: List[MatchBetTuple]):
+        self.matchbet_data = data
+
 
 def main():
     app = QApplication(sys.argv)
-    try:
-        client = authorize_client(); spreadsheet = client.open(SPREADSHEET_NAME)
-    except Exception as e:
-        QMessageBox.critical(None, "Startup Error", f"Failed to initialize Google Sheets: {e}"); return 1
+    
+    client = None
+    spreadsheet = None
+    last_error = None
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            client = authorize_client()
+            spreadsheet = client.open(SPREADSHEET_NAME)
+            break
+        except Exception as e:
+            last_error = e
+            print(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+
+    if spreadsheet is None:
+        QMessageBox.critical(None, "Startup Error", f"Failed to initialize Google Sheets after {max_retries} attempts: {last_error}")
+        return 1
+
     win = MainWindow(spreadsheet)
     dlg = PreloadDialog(); preload_thread = QThread(); worker = PreloadWorker(spreadsheet, SPORTS); worker.moveToThread(preload_thread)
     preload_thread.started.connect(worker.run)
@@ -498,7 +661,9 @@ def main():
         preload_thread.quit(); preload_thread.wait(); worker.deleteLater(); dlg.accept()
         if not ok:
             QMessageBox.critical(win, "Preload Failed", f"Failed to preload data:\n{msg}"); win.close(); return
-        win.set_initial_cache(worker.cache); win.show()
+        win.set_initial_cache(worker.cache)
+        win.set_matchbet_data(worker.matchbet_data)
+        win.show()
     worker.finished.connect(done)
     QTimer.singleShot(60000, lambda: done(False, "Preloading timed out") if preload_thread.isRunning() else None)
     preload_thread.start(); dlg.exec()
