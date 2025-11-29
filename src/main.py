@@ -10,7 +10,8 @@ from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
-    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar, QHeaderView
+    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar, QHeaderView,
+    QTreeWidget, QTreeWidgetItem
 )
 
 import gspread
@@ -35,11 +36,11 @@ COL_RANGE = "F2:M"
 SPORTS = ["CS2", "Valorant", "R6S", "COD", "LOL", "Dota 2", "Basketball", "Tennis", "Ice Hockey"]
 
 MATCHBET_SHEET_NAME = "MATCHBET"
-MATCHBET_COL_RANGE = "B2:D"
+MATCHBET_COL_RANGE = "A2:D"
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
-MatchBetTuple = Tuple[str, str, str]
+MatchBetTuple = Tuple[str, str, str, str]
 
 
 @dataclass
@@ -147,6 +148,8 @@ def normalize_tournament_name(name: str) -> str:
         r'(?<!^)\b(Europe|EU|NA|SA|Asia|Americas|Oceania|CIS|European|South American|North American|Pacific|APAC)\b',
         r'\bLCQ\b',
         r'\b(Play-In|Global Finals|Contenders|CQ|Finals?|Groups?|Playoffs?)\b',
+        r'\b\d+(?:st|nd|rd|th)?\s+Division\b',
+        r'\bDivision\s+\d+\b',
         r'\bSeries\b',
         r'(?<!^)(?<!\bIEM\s)\b(Atlanta|Katowice|Bangkok|Raleigh)\b',
         r'\b(Spring|Summer|Fall|Winter)\b',
@@ -207,20 +210,21 @@ def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
         
         data: List[MatchBetTuple] = []
         for r in raw:
-            # We expect 3 columns: Tournament (B), Matchup (C), Bet (D)
+            # We expect 4 columns: Sport (A), Tournament (B), Matchup (C), Bet (D)
             # Pad if shorter
-            if len(r) < 3:
-                r = r + [""] * (3 - len(r))
+            if len(r) < 4:
+                r = r + [""] * (4 - len(r))
             
-            tournament = r[0].strip()
-            matchup = r[1].strip()
-            bet = r[2].strip()
+            sport = r[0].strip()
+            tournament = r[1].strip()
+            matchup = r[2].strip()
+            bet = r[3].strip()
             
             # Skip empty rows if necessary
-            if not tournament and not matchup and not bet:
+            if not sport and not tournament and not matchup and not bet:
                 continue
                 
-            data.append((tournament, matchup, bet))
+            data.append((sport, tournament, matchup, bet))
         return data
     except Exception as e:
         print(f"Error fetching matchbet data: {e}")
@@ -551,37 +555,68 @@ class MainWindow(QMainWindow):
         tournament_group = QGroupBox("Tournament Statistics")
         t_layout = QVBoxLayout(tournament_group)
 
-        # Calculate stats with normalization
-        tournaments = [normalize_tournament_name(t[0]) for t in self.matchbet_data if t[0]] # Filter empty tournament names
-        counts = Counter(tournaments)
-        
-        # Create table
-        stats_table = QTableWidget(len(counts), 2)
-        stats_table.setHorizontalHeaderLabels(["Tournament", "Bet Count"])
-        stats_table.horizontalHeader().setStretchLastSection(False)
-        stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        stats_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        stats_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        stats_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        
-        # Sort by count descending
-        sorted_counts = counts.most_common()
-        
-        for r, (tourney, count) in enumerate(sorted_counts):
-            t_item = QTableWidgetItem(tourney)
-            c_item = QTableWidgetItem(str(count))
-            c_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            stats_table.setItem(r, 0, t_item)
-            stats_table.setItem(r, 1, c_item)
+        # Group by Sport -> Tournament
+        # matchbet_data is list of (sport, tournament, matchup, bet)
+        stats = {}
+        for sport, tournament, _, _ in self.matchbet_data:
+            if not sport: continue
             
-        t_layout.addWidget(QLabel(f"Total Bets: {len(self.matchbet_data)}"))
-        t_layout.addWidget(stats_table)
+            # Normalize sport names
+            if sport == "CStwo":
+                sport = "CS2"
 
-        # Add container to main layout
-        layout.addWidget(tournament_group)
+            # Only show statistics for sports available in the app
+            if sport not in SPORTS:
+                continue
+
+            if not tournament: continue
+            
+            norm_tourney = normalize_tournament_name(tournament)
+            if not norm_tourney: continue
+            
+            if sport not in stats:
+                stats[sport] = Counter()
+            stats[sport][norm_tourney] += 1
         
-        # Add stretch to push everything up
-        layout.addStretch()
+        # Create Tree Widget
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Sport / Tournament", "Bet Count"])
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        
+        # Populate Tree
+        # Sort sports by total bets descending
+        sport_totals = {s: sum(c.values()) for s, c in stats.items()}
+        sorted_sports = sorted(stats.keys(), key=lambda s: sport_totals[s], reverse=True)
+
+        for sport in sorted_sports:
+            sport_counts = stats[sport]
+            total_sport_bets = sport_totals[sport]
+            
+            sport_item = QTreeWidgetItem(tree)
+            sport_item.setText(0, sport)
+            sport_item.setText(1, str(total_sport_bets))
+            sport_item.setExpanded(False)
+            
+            # Sort tournaments by count descending
+            for tourney, count in sport_counts.most_common():
+                t_item = QTreeWidgetItem(sport_item)
+                t_item.setText(0, tourney)
+                t_item.setText(1, str(count))
+                t_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+
+        total_visible_bets = sum(sport_totals.values())
+        t_layout.addWidget(QLabel(f"Total Bets: {total_visible_bets}"))
+        t_layout.addWidget(tree)
+
+        # --- Container 2: Empty ---
+        second_group = QGroupBox("Additional Statistics")
+        QVBoxLayout(second_group)
+
+        # Add containers to main layout
+        layout.addWidget(tournament_group, 4)
+        layout.addWidget(second_group, 2)
+        layout.addStretch(1)
 
     def show_data_table_panel(self):
         """Switch to data table view"""
