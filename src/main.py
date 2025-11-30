@@ -36,11 +36,11 @@ COL_RANGE = "F2:M"
 SPORTS = ["CS2", "Valorant", "R6S", "COD", "LOL", "Dota 2", "Basketball", "Tennis", "Ice Hockey"]
 
 MATCHBET_SHEET_NAME = "MATCHBET"
-MATCHBET_COL_RANGE = "A2:D"
+MATCHBET_COL_RANGE = "A2:H"  # Fetch extra column just in case
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
-MatchBetTuple = Tuple[str, str, str, str]
+MatchBetTuple = Tuple[str, str, str, str, str]
 
 
 @dataclass
@@ -151,7 +151,7 @@ def normalize_tournament_name(name: str) -> str:
         r'\b\d+(?:st|nd|rd|th)?\s+Division\b',
         r'\bDivision\s+\d+\b',
         r'\bSeries\b',
-        r'(?<!^)(?<!\bIEM\s)\b(Atlanta|Katowice|Bangkok|Raleigh)\b',
+        r'(?<!^)(?<!\bIEM\s)\b(Atlanta|Katowice|Bangkok|Raleigh|Lisbon)\b',
         r'\b(Spring|Summer|Fall|Winter)\b',
         r'\b(I|II|III|IV|V|VI|VII|VIII|IX|X)\b'
     ]
@@ -209,22 +209,23 @@ def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
             raw = ws.batch_get([MATCHBET_COL_RANGE])[0]
         
         data: List[MatchBetTuple] = []
-        for r in raw:
-            # We expect 4 columns: Sport (A), Tournament (B), Matchup (C), Bet (D)
+        for i, r in enumerate(raw):
+            # We expect 8 columns: Sport (A), Tournament (B), Matchup (C), Bet (D) ... Result (H)
             # Pad if shorter
-            if len(r) < 4:
-                r = r + [""] * (4 - len(r))
+            if len(r) < 8:
+                r = r + [""] * (8 - len(r))
             
             sport = r[0].strip()
             tournament = r[1].strip()
             matchup = r[2].strip()
             bet = r[3].strip()
+            result = r[7].strip()
             
             # Skip empty rows if necessary
             if not sport and not tournament and not matchup and not bet:
                 continue
                 
-            data.append((sport, tournament, matchup, bet))
+            data.append((sport, tournament, matchup, bet, result))
         return data
     except Exception as e:
         print(f"Error fetching matchbet data: {e}")
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.spreadsheet = spreadsheet
         self.setWindowTitle("Google Sheets Bet EV Viewer")
         self.resize(1200, 800)
+        self.setMinimumSize(900, 600)
         self.data_cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
         self.current_rows: List[RowTuple] = []
@@ -556,9 +558,10 @@ class MainWindow(QMainWindow):
         t_layout = QVBoxLayout(tournament_group)
 
         # Group by Sport -> Tournament
-        # matchbet_data is list of (sport, tournament, matchup, bet)
+        # matchbet_data is list of (sport, tournament, matchup, bet, result)
+        # stats structure: stats[sport][tournament] = {'wins': 0, 'total': 0}
         stats = {}
-        for sport, tournament, _, _ in self.matchbet_data:
+        for sport, tournament, _, _, result in self.matchbet_data:
             if not sport: continue
             
             # Normalize sport names
@@ -575,37 +578,74 @@ class MainWindow(QMainWindow):
             if not norm_tourney: continue
             
             if sport not in stats:
-                stats[sport] = Counter()
-            stats[sport][norm_tourney] += 1
+                stats[sport] = {}
+            if norm_tourney not in stats[sport]:
+                stats[sport][norm_tourney] = {'wins': 0, 'total': 0}
+            
+            stats[sport][norm_tourney]['total'] += 1
+            if result.lower() == "win":
+                stats[sport][norm_tourney]['wins'] += 1
         
         # Create Tree Widget
         tree = QTreeWidget()
-        tree.setHeaderLabels(["Sport / Tournament", "Bet Count"])
-        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree.setMinimumWidth(400)
+        tree.setHeaderLabels(["Sport / Tournament", "Bet Count", "Winrate %"])
+        tree.setAlternatingRowColors(True)
+        
+        # Configure columns: Stretch first, Fixed width for others
+        header = tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        
+        tree.setColumnWidth(1, 100)
+        tree.setColumnWidth(2, 100)
+        
+        # Center align headers for numeric columns
+        tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+        tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
         
         # Populate Tree
         # Sort sports by total bets descending
-        sport_totals = {s: sum(c.values()) for s, c in stats.items()}
-        sorted_sports = sorted(stats.keys(), key=lambda s: sport_totals[s], reverse=True)
+        sport_totals = {}
+        for s, tourneys in stats.items():
+            s_wins = sum(t['wins'] for t in tourneys.values())
+            s_total = sum(t['total'] for t in tourneys.values())
+            sport_totals[s] = {'wins': s_wins, 'total': s_total}
+
+        sorted_sports = sorted(stats.keys(), key=lambda s: sport_totals[s]['total'], reverse=True)
 
         for sport in sorted_sports:
-            sport_counts = stats[sport]
-            total_sport_bets = sport_totals[sport]
+            s_data = sport_totals[sport]
+            total_sport_bets = s_data['total']
+            total_sport_wins = s_data['wins']
+            sport_wr = (total_sport_wins / total_sport_bets * 100) if total_sport_bets > 0 else 0.0
             
             sport_item = QTreeWidgetItem(tree)
             sport_item.setText(0, sport)
             sport_item.setText(1, str(total_sport_bets))
+            sport_item.setText(2, f"{sport_wr:.1f}%")
+            sport_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+            sport_item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
             sport_item.setExpanded(False)
             
             # Sort tournaments by count descending
-            for tourney, count in sport_counts.most_common():
+            tourneys = stats[sport]
+            sorted_tourneys = sorted(tourneys.items(), key=lambda item: item[1]['total'], reverse=True)
+
+            for tourney, t_data in sorted_tourneys:
+                t_total = t_data['total']
+                t_wins = t_data['wins']
+                t_wr = (t_wins / t_total * 100) if t_total > 0 else 0.0
+
                 t_item = QTreeWidgetItem(sport_item)
                 t_item.setText(0, tourney)
-                t_item.setText(1, str(count))
+                t_item.setText(1, str(t_total))
+                t_item.setText(2, f"{t_wr:.1f}%")
                 t_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                t_item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
 
-        total_visible_bets = sum(sport_totals.values())
+        total_visible_bets = sum(d['total'] for d in sport_totals.values())
         t_layout.addWidget(QLabel(f"Total Bets: {total_visible_bets}"))
         t_layout.addWidget(tree)
 
