@@ -3,14 +3,13 @@ from __future__ import annotations
 import sys, os, re, time
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-from collections import Counter
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
-    QMessageBox, QDialog, QProgressBar, QSplitter, QStatusBar, QHeaderView,
+    QMessageBox, QDialog, QProgressBar, QStatusBar, QHeaderView,
     QTreeWidget, QTreeWidgetItem
 )
 
@@ -31,16 +30,13 @@ load_dotenv()
 
 JSON_KEYFILE = "my-matchbettings-ev-script-878cbe8fa582.json"
 SPREADSHEET_NAME = "Match betting"
-DEFAULT_SHEET = "Each Unique Odds"
-COL_RANGE = "F2:M" 
-SPORTS = ["CS2", "Valorant", "R6S", "COD", "LOL", "Dota 2", "Basketball", "Tennis", "Ice Hockey"]
 
 MATCHBET_SHEET_NAME = "MATCHBET"
-MATCHBET_COL_RANGE = "A2:H"  # Fetch extra column just in case
+MATCHBET_COL_RANGE = "A2:H"
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
-MatchBetTuple = Tuple[str, str, str, str, str]
+MatchBetTuple = Tuple[str, str, str, str, str, float, str]
 
 
 @dataclass
@@ -56,25 +52,6 @@ def resource_path(name: str) -> str:
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, name)
-
-
-def parse_wr(s: str) -> Optional[float]:
-    if not s or s.strip() == "":
-        return None
-    try:
-        x = float(s.replace("%", "").strip())
-        return x / 100.0 if x > 1 else x
-    except Exception:
-        return None
-
-
-def parse_count(s: str) -> Optional[int]:
-    if not s or s.strip() == "":
-        return None
-    try:
-        return int(float(s.strip()))
-    except Exception:
-        return None
 
 
 def round_odds_key(v) -> Optional[float]:
@@ -169,37 +146,6 @@ def normalize_tournament_name(name: str) -> str:
     return name
 
 
-def fetch_sheet_data(spreadsheet, sheet_name: str) -> SheetCacheEntry:
-    ws = spreadsheet.worksheet(sheet_name)
-    try:
-        raw = ws.get(COL_RANGE)
-    except Exception:
-        raw = ws.batch_get([COL_RANGE])[0]
-    rows: List[RowTuple] = []
-    index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
-    for r in raw:
-        # Need at least 8 columns (F..M). Pad if shorter for backward compatibility.
-        if len(r) < 8:
-            r = r + [""] * (8 - len(r))
-        odds_s, _legacy_cnt, _c2, _c3, live_wr_s, prem_wr_s, live_cnt_s, prem_cnt_s = r[:8]
-        odds_s = (odds_s or '').strip()
-        if not odds_s:
-            continue
-        try:
-            odds = float(odds_s.replace('%',''))
-        except ValueError:
-            continue
-        live_wr = parse_wr(live_wr_s)
-        prem_wr = parse_wr(prem_wr_s)
-        live_cnt = parse_count(live_cnt_s)
-        prem_cnt = parse_count(prem_cnt_s)
-        tup: RowTuple = (odds, live_wr, prem_wr, live_cnt, prem_cnt)
-        rows.append(tup)
-        k = round_odds_key(odds)
-        if k is not None and k not in index:
-            index[k] = (live_wr, prem_wr, live_cnt, prem_cnt)
-    return SheetCacheEntry(rows, index)
-
 def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
     try:
         ws = spreadsheet.worksheet(MATCHBET_SHEET_NAME)
@@ -209,9 +155,7 @@ def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
             raw = ws.batch_get([MATCHBET_COL_RANGE])[0]
         
         data: List[MatchBetTuple] = []
-        for i, r in enumerate(raw):
-            # We expect 8 columns: Sport (A), Tournament (B), Matchup (C), Bet (D) ... Result (H)
-            # Pad if shorter
+        for r in raw:
             if len(r) < 8:
                 r = r + [""] * (8 - len(r))
             
@@ -219,50 +163,81 @@ def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
             tournament = r[1].strip()
             matchup = r[2].strip()
             bet = r[3].strip()
+            live_status = r[4].strip()
+            odds_s = r[5].strip()
             result = r[7].strip()
             
-            # Skip empty rows if necessary
-            if not sport and not tournament and not matchup and not bet:
+            if not sport: continue
+            if not result: continue
+            
+            try:
+                odds = float(odds_s.replace(',', '.'))
+            except ValueError:
                 continue
-                
-            data.append((sport, tournament, matchup, bet, result))
+
+            data.append((sport, tournament, matchup, bet, live_status, odds, result))
         return data
     except Exception as e:
         print(f"Error fetching matchbet data: {e}")
         return []
 
 
+def process_bets_to_cache(bets: List[MatchBetTuple]) -> Dict[str, SheetCacheEntry]:
+    agg = {}
+    for sport, _, _, _, live_status, odds, result in bets:
+        if sport not in agg: agg[sport] = {}
+        k = round_odds_key(odds)
+        if k is None: continue
+        if k not in agg[sport]: agg[sport][k] = {'lw':0,'lt':0,'pw':0,'pt':0}
+        
+        is_live = "LIVE" in live_status.upper() and "NOT" not in live_status.upper()
+        is_win = result.lower() == "win"
+        
+        if is_live:
+            agg[sport][k]['lt'] += 1
+            if is_win: agg[sport][k]['lw'] += 1
+        else:
+            agg[sport][k]['pt'] += 1
+            if is_win: agg[sport][k]['pw'] += 1
+            
+    cache = {}
+    for sport, odds_map in agg.items():
+        rows = []
+        index = {}
+        for k in sorted(odds_map.keys()):
+            stats = odds_map[k]
+            lt, lw = stats['lt'], stats['lw']
+            pt, pw = stats['pt'], stats['pw']
+            live_wr = (lw / lt) if lt > 0 else None
+            prem_wr = (pw / pt) if pt > 0 else None
+            tup = (k, live_wr, prem_wr, lt if lt > 0 else None, pt if pt > 0 else None)
+            rows.append(tup)
+            index[k] = (live_wr, prem_wr, lt if lt > 0 else None, pt if pt > 0 else None)
+        cache[sport] = SheetCacheEntry(rows, index)
+    return cache
+
+
 class PreloadWorker(QObject):
     progress = pyqtSignal(str)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
-    def __init__(self, spreadsheet, sports: List[str]):
+    def __init__(self, spreadsheet):
         super().__init__()
         self.spreadsheet = spreadsheet
-        self.sports = sports
         self.cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
 
     def run(self):
         try:
-            total = len(self.sports)
-            for i, s in enumerate(self.sports):
-                self.progress.emit(f"Loading {s}... ({i+1}/{total})")
-                self.status.emit(f"Fetching data for {s}")
-                try:
-                    self.cache[s] = fetch_sheet_data(self.spreadsheet, s)
-                    self.status.emit(f"Loaded {len(self.cache[s].rows)} records for {s}")
-                except Exception as e:
-                    self.status.emit(f"Error loading {s}: {e}")
+            self.progress.emit("Fetching MATCHBET data...")
+            self.status.emit("Downloading all bets...")
             
-            # Fetch MATCHBET data
-            self.progress.emit("Loading Match Bets...")
-            self.status.emit("Fetching MATCHBET sheet")
             self.matchbet_data = fetch_matchbet_data(self.spreadsheet)
-            self.status.emit(f"Loaded {len(self.matchbet_data)} match bets")
-
-            self.progress.emit("Preparing statistics...")
-            self.status.emit("Priming charts")
+            self.status.emit(f"Loaded {len(self.matchbet_data)} bets. Processing...")
+            
+            self.cache = process_bets_to_cache(self.matchbet_data)
+            
+            self.progress.emit("Finalizing...")
             self.finished.emit(True, "")
         except Exception as e:
             self.finished.emit(False, str(e))
@@ -270,14 +245,15 @@ class PreloadWorker(QObject):
 
 class RefreshWorker(QObject):
     finished = pyqtSignal(bool, str, object)
-    def __init__(self, spreadsheet, sheet_name: str):
+    def __init__(self, spreadsheet):
         super().__init__()
         self.spreadsheet = spreadsheet
-        self.sheet_name = sheet_name
+
     def run(self):
         try:
-            entry = fetch_sheet_data(self.spreadsheet, self.sheet_name)
-            self.finished.emit(True, self.sheet_name, entry)
+            data = fetch_matchbet_data(self.spreadsheet)
+            cache = process_bets_to_cache(data)
+            self.finished.emit(True, "Refreshed all data", (cache, data))
         except Exception as e:
             self.finished.emit(False, str(e), None)
 
@@ -338,7 +314,7 @@ class MainWindow(QMainWindow):
         # Sport and Bet Type selectors
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(QLabel("Sport:"))
-        self.sport_combo = QComboBox(); self.sport_combo.addItems(SPORTS); controls_layout.addWidget(self.sport_combo)
+        self.sport_combo = QComboBox(); controls_layout.addWidget(self.sport_combo)
         controls_layout.addWidget(QLabel("Bet Type:"))
         self.bettype_combo = QComboBox(); self.bettype_combo.addItems(["Live", "Not Live"]); controls_layout.addWidget(self.bettype_combo)
         sidebar_layout.addLayout(controls_layout)
@@ -415,11 +391,17 @@ class MainWindow(QMainWindow):
         for w in [self.sport_combo,self.bettype_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
             w.setEnabled(enabled)
 
-    # Data
-    def get_data_for_sheet(self, sheet: str, force: bool=False) -> SheetCacheEntry:
-        if not force and sheet in self.data_cache: return self.data_cache[sheet]
-        entry = fetch_sheet_data(self.spreadsheet, sheet); self.data_cache[sheet] = entry; return entry
+    def get_sorted_sports(self) -> List[str]:
+        def count_bets(sport):
+            entry = self.data_cache[sport]
+            total = 0
+            for r in entry.rows:
+                # r[3] is live_cnt, r[4] is prem_cnt
+                total += (r[3] or 0) + (r[4] or 0)
+            return total
+        return sorted(self.data_cache.keys(), key=count_bets, reverse=True)
 
+    # Data
     def fill_table(self, rows: List[RowTuple], bet_type: str):
         self.table.setRowCount(0)
         # Fetch theme colors from application properties (with fallbacks)
@@ -479,7 +461,7 @@ class MainWindow(QMainWindow):
             missing_odds = odds_a if wr_a is None else odds_b
             cnt = 'N/A' if present_count is None else str(present_count)
             self.compare_result.setText(
-                f"Odds {missing_odds:.2f} is missing {label_type} WR. Showing available bet only (no comparison).\n\n"
+                f"Odds {missing_odds:.2f} is missing {label_type} WR.\n\n"
                 f"Bet {present_odds:.2f} EV: {present_ev*100:.2f}% (WR: {present_wr*100:.2f}%, Count: {cnt})")
             return
         score_a, score_b = wr_a*odds_a, wr_b*odds_b
@@ -515,7 +497,7 @@ class MainWindow(QMainWindow):
                 self.compare_result.setText((f"Odd {odds_a:.2f} not found. " if miss_a else f"Odd {odds_b:.2f} not found. ")+f"Odds {po:.2f} is in data but missing {bet_type} WR."); return
             ev_p = (wr_p*po)-1.0; cnt_s='N/A' if cnt_p is None else str(cnt_p)
             missing = f"Odd {odds_a:.2f} not found." if miss_a else f"Odd {odds_b:.2f} not found."
-            self.compare_result.setText(f"{missing} Showing available bet only (no comparison).\n\nBet {po:.2f} EV: {ev_p*100:.2f}% (WR: {wr_p*100:.2f}%, Count: {cnt_s})")
+            self.compare_result.setText(f"{missing}\n\nBet {po:.2f} EV: {ev_p*100:.2f}% (WR: {wr_p*100:.2f}%, Count: {cnt_s})")
             return
         wr_a_live, wr_a_pre, live_cnt_a, prem_cnt_a = self.odds_index[k_a]; wr_b_live, wr_b_pre, live_cnt_b, prem_cnt_b = self.odds_index[k_b]
         wr_a = wr_a_live if bet_type=="Live" else wr_a_pre; wr_b = wr_b_live if bet_type=="Live" else wr_b_pre
@@ -558,19 +540,15 @@ class MainWindow(QMainWindow):
         t_layout = QVBoxLayout(tournament_group)
 
         # Group by Sport -> Tournament
-        # matchbet_data is list of (sport, tournament, matchup, bet, result)
+        # matchbet_data is list of (sport, tournament, matchup, bet, live_status, odds, result)
         # stats structure: stats[sport][tournament] = {'wins': 0, 'total': 0}
         stats = {}
-        for sport, tournament, _, _, result in self.matchbet_data:
+        for sport, tournament, _, _, _, _, result in self.matchbet_data:
             if not sport: continue
             
             # Normalize sport names
             if sport == "CStwo":
                 sport = "CS2"
-
-            # Only show statistics for sports available in the app
-            if sport not in SPORTS:
-                continue
 
             if not tournament: continue
             
@@ -665,7 +643,7 @@ class MainWindow(QMainWindow):
         self.table.show()
 
     def refresh_data(self, force: bool=False):
-        sheet = self.sport_combo.currentText() or DEFAULT_SHEET
+        sheet = self.sport_combo.currentText()
         # If we already have this sheet cached and not forcing, use cache instantly
         if not force and sheet in self.data_cache:
             entry = self.data_cache[sheet]
@@ -677,26 +655,55 @@ class MainWindow(QMainWindow):
             self.set_status("Loaded from cache")
             return
         # Otherwise perform an async refresh from Google Sheets
-        self.set_status(f"Loading {sheet} (fetching)..."); self.set_controls_enabled(False)
-        t=QThread(); w=RefreshWorker(self.spreadsheet, sheet); w.moveToThread(t)
+        self.set_status(f"Refreshing all data..."); self.set_controls_enabled(False)
+        t=QThread(); w=RefreshWorker(self.spreadsheet); w.moveToThread(t)
         t.started.connect(w.run)
-        w.finished.connect(lambda ok, info, entry: self._on_refresh_done(t,w,ok,info,entry))
+        w.finished.connect(lambda ok, info, res: self._on_refresh_done(t,w,ok,info,res))
         t.start()
 
-    def _on_refresh_done(self, thread: QThread, worker: RefreshWorker, ok: bool, info: str, entry: Optional[SheetCacheEntry]):
+    def _on_refresh_done(self, thread: QThread, worker: RefreshWorker, ok: bool, info: str, res: object):
         thread.quit(); thread.wait(); worker.deleteLater()
-        if ok and entry:
-            self.data_cache[info]=entry; self.current_rows=entry.rows; self.odds_index=entry.index
-            self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.setWindowTitle(f"Google Sheets Bet EV Viewer - {info}")
-            self.recompute_comparison_inline()
+        if ok and res:
+            cache, data = res
+            self.data_cache = cache
+            self.matchbet_data = data
+            
+            # Update sport combo if new sports appeared
+            current_sport = self.sport_combo.currentText()
+            self.sport_combo.blockSignals(True)
+            self.sport_combo.clear()
+            self.sport_combo.addItems(self.get_sorted_sports())
+            if current_sport in self.data_cache:
+                self.sport_combo.setCurrentText(current_sport)
+            elif self.sport_combo.count() > 0:
+                self.sport_combo.setCurrentIndex(0)
+            self.sport_combo.blockSignals(False)
+            
+            # Refresh view
+            current_sport = self.sport_combo.currentText()
+            if current_sport in self.data_cache:
+                entry = self.data_cache[current_sport]
+                self.current_rows=entry.rows; self.odds_index=entry.index
+                self.fill_table(self.current_rows, self.bettype_combo.currentText())
+                self.setWindowTitle(f"Google Sheets Bet EV Viewer - {current_sport}")
+                self.recompute_comparison_inline()
         else:
             QMessageBox.critical(self, "Error", f"Failed to load data: {info}")
         self.set_controls_enabled(True); self.set_status("Ready")
 
     def set_initial_cache(self, cache: Dict[str, SheetCacheEntry]):
-        self.data_cache.update(cache)
-        first = self.sport_combo.currentText() or DEFAULT_SHEET
-        if first in self.data_cache:
+        self.data_cache = cache
+        
+        # Populate sports combo
+        self.sport_combo.blockSignals(True)
+        self.sport_combo.clear()
+        sports = self.get_sorted_sports()
+        self.sport_combo.addItems(sports)
+        self.sport_combo.blockSignals(False)
+        
+        if sports:
+            first = sports[0]
+            self.sport_combo.setCurrentText(first)
             entry = self.data_cache[first]
             self.current_rows=entry.rows; self.odds_index=entry.index
             self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.recompute_comparison_inline()
@@ -729,7 +736,7 @@ def main():
         return 1
 
     win = MainWindow(spreadsheet)
-    dlg = PreloadDialog(); preload_thread = QThread(); worker = PreloadWorker(spreadsheet, SPORTS); worker.moveToThread(preload_thread)
+    dlg = PreloadDialog(); preload_thread = QThread(); worker = PreloadWorker(spreadsheet); worker.moveToThread(preload_thread)
     preload_thread.started.connect(worker.run)
     worker.progress.connect(dlg.update_progress); worker.status.connect(dlg.update_status)
     def done(ok: bool, msg: str):
