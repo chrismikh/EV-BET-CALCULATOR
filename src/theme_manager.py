@@ -5,8 +5,16 @@
 
 from __future__ import annotations
 
+import sys, os
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import QApplication
+
+def resource_path(name: str) -> str:
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name).replace("\\", "/")
 
 try:
     import matplotlib as _mpl  # type: ignore
@@ -102,8 +110,8 @@ QLineEdit, QComboBox {{
 QComboBox::drop-down {{ border: none; }}
 QComboBox::down-arrow {{ image: url(v); }}
 
-/* Table */
-QTableWidget {{
+/* Table and Tree */
+QTableWidget, QTreeWidget {{
     gridline-color: transparent;
     background-color: {_DARK_BG_ALT.name()};
     border-radius: 12px;
@@ -113,11 +121,25 @@ QTableWidget {{
 QHeaderView::section:horizontal:first {{ border-top-left-radius: 12px; }}
 QHeaderView::section:horizontal:last {{ border-top-right-radius: 12px; }}
 QTableCornerButton::section {{ border-top-left-radius: 12px; }}
-QTableWidget::item {{ padding: 5px; }}
-QTableWidget::item:alternate {{ background-color: #303042; }}
+QTableWidget::item, QTreeWidget::item {{ padding: 5px 12px; }}
+QTableWidget::item:alternate, QTreeWidget::item:alternate {{ background-color: #303042; }}
 QHeaderView::section {{
     background-color: #36364f; font-weight: bold;
-    padding: 6px; border: none;
+    padding: 6px 30px 6px 60px; border: none;
+}}
+QHeaderView::down-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-down-white.svg")});
+    width: 16px; height: 16px;
+    right: 40px;
+}}
+QHeaderView::up-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-up-white.svg")});
+    width: 16px; height: 16px;
+    right: 40px;
 }}
 QTableCornerButton::section {{ background-color: #36364f; }}
 
@@ -163,19 +185,25 @@ QPushButton:checked {{ background-color: {_ACCENT_LIGHT.name()}; color: white; b
 QPushButton:disabled {{
     background-color: #f1f2f4; color: #9ca3af;
     border: 1px solid #e2e5e9;
+QHeaderView::section {{
+    background-color: #f9fafb; font-weight: bold;
+    padding: 6px 30px 6px 60px; border: none; border-bottom: 1px solid #e5e7eb;
 }}
-
-/* Inputs */
-QLineEdit, QComboBox {{
-    background-color: white; border: 1px solid #d1d5db;
-    padding: 6px 10px; border-radius: 10px;
+QHeaderView::down-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-down-black.svg")});
+    width: 16px; height: 16px;
+    right: 40px;
 }}
-#Sidebar QLabel {{ background: transparent; }}
-QComboBox::drop-down {{ border: none; }}
-
-/* Table */
-QTableWidget {{
-    gridline-color: transparent;
+QHeaderView::up-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-up-black.svg")});
+    width: 16px; height: 16px;
+    right: 40px;
+}}
+QTableCornerButton::section {{ background-color: #f9fafb; }}
     background-color: white;
     border: 1px solid #e5e7eb;
     border-radius: 12px;
@@ -183,8 +211,8 @@ QTableWidget {{
 QHeaderView::section:horizontal:first {{ border-top-left-radius: 12px; }}
 QHeaderView::section:horizontal:last {{ border-top-right-radius: 12px; }}
 QTableCornerButton::section {{ border-top-left-radius: 12px; }}
-QTableWidget::item {{ padding: 5px; }}
-QTableWidget::item:alternate {{ background-color: #f9fafb; }}
+QTableWidget::item, QTreeWidget::item {{ padding: 5px 12px; }}
+QTableWidget::item:alternate, QTreeWidget::item:alternate {{ background-color: #f9fafb; }}
 QHeaderView::section {{
     background-color: #f9fafb; font-weight: bold;
     padding: 6px; border: none; border-bottom: 1px solid #e5e7eb;

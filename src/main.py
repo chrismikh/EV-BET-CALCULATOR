@@ -278,13 +278,26 @@ class PreloadDialog(QDialog):
     def update_status(self, t: str): self.lbl_status.setText(t)
 
 
+class SortableTableWidgetItem(QTableWidgetItem):
+    def __init__(self, text, sort_value):
+        super().__init__(text)
+        self.sort_value = sort_value
+
+    def __lt__(self, other):
+        v1 = self.sort_value
+        v2 = other.sort_value
+        if v1 is None: v1 = -float('inf')
+        if v2 is None: v2 = -float('inf')
+        return v1 < v2
+
+
 class MainWindow(QMainWindow):
     def __init__(self, spreadsheet):
         super().__init__()
         self.spreadsheet = spreadsheet
         self.setWindowTitle("Google Sheets Bet EV Viewer")
         self.resize(1200, 800)
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(1150, 600)
         self.data_cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
         self.current_rows: List[RowTuple] = []
@@ -351,11 +364,24 @@ class MainWindow(QMainWindow):
         # Data Table
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Odds", "Live WR %", "Prematch WR %", "EV %"])
-        # Stretch last column (EV %) to fill remaining space
-        self.table.horizontalHeader().setStretchLastSection(True)
+        
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
+
+        # Configure Header
+        header = self.table.horizontalHeader()
+        header.setSortIndicatorShown(True)
+        header.setSectionsMovable(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Stretch all columns to fill available space evenly
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        
         main_layout.addWidget(self.table, 1)
         
         # Statistics Panel (initially hidden)
@@ -400,9 +426,9 @@ class MainWindow(QMainWindow):
                 total += (r[3] or 0) + (r[4] or 0)
             return total
         return sorted(self.data_cache.keys(), key=count_bets, reverse=True)
-
     # Data
     def fill_table(self, rows: List[RowTuple], bet_type: str):
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         # Fetch theme colors from application properties (with fallbacks)
         app = QApplication.instance()
@@ -417,13 +443,27 @@ class MainWindow(QMainWindow):
             wr = live_wr if bet_type=="Live" else prem_wr
             ev_str, ev_val = fmt_ev(wr, odds)
             r = self.table.rowCount(); self.table.insertRow(r)
-            cells = [f"{odds:.2f}", fmt_wr(live_wr), fmt_wr(prem_wr), ev_str]
-            for c, txt in enumerate(cells):
-                it = QTableWidgetItem(txt); it.setTextAlignment(Qt.AlignmentFlag.AlignCenter); self.table.setItem(r,c,it)
+            
+            # Create sortable items
+            it_odds = SortableTableWidgetItem(f"{odds:.2f}", odds)
+            it_live = SortableTableWidgetItem(fmt_wr(live_wr), live_wr)
+            it_prem = SortableTableWidgetItem(fmt_wr(prem_wr), prem_wr)
+            it_ev = SortableTableWidgetItem(ev_str, ev_val)
+            
+            cells = [it_odds, it_live, it_prem, it_ev]
+            for c, it in enumerate(cells):
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r,c,it)
             color = neu if wr is None else pos if ev_val and ev_val>0 else neg
             for c in range(4): self.table.item(r,c).setForeground(color)
+        self.table.setSortingEnabled(True)
+        
+        # Re-apply sort to match the indicator
+        header = self.table.horizontalHeader()
+        self.table.sortItems(header.sortIndicatorSection(), header.sortIndicatorOrder())
 
     def update_ev_only(self):
+        self.table.setSortingEnabled(False)
         bt = self.bettype_combo.currentText()
         # Fetch theme colors (same logic as fill_table)
         app = QApplication.instance()
@@ -443,9 +483,20 @@ class MainWindow(QMainWindow):
             prem_wr = parse_cell(self.table.item(r,2).text())
             wr = live_wr if bt=="Live" else prem_wr
             ev_str, ev_val = fmt_ev(wr, odds)
-            self.table.item(r,3).setText(ev_str)
+            
+            it = self.table.item(r,3)
+            it.setText(ev_str)
+            if isinstance(it, SortableTableWidgetItem):
+                it.sort_value = ev_val
+            
             color = neu if wr is None else pos if ev_val and ev_val>0 else neg
             for c in range(4): self.table.item(r,c).setForeground(color)
+        self.table.setSortingEnabled(True)
+        
+        # Re-apply sort
+        header = self.table.horizontalHeader()
+        self.table.sortItems(header.sortIndicatorSection(), header.sortIndicatorOrder())
+        
         self.recompute_comparison_inline()
 
     # Comparison
@@ -575,6 +626,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionsMovable(False)
         
         tree.setColumnWidth(1, 100)
         tree.setColumnWidth(2, 100)
