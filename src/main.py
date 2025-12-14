@@ -61,14 +61,43 @@ def round_odds_key(v) -> Optional[float]:
         return None
 
 
+def calc_true_prob(odds: float, wr_raw: float, n: int, k: int = 50):
+    """
+    Compute the true probability using Bayesian shrinkage:
+    p_final = (wr_raw * n + p_market * k) / (n + k)
+    """
+    if wr_raw is None or n is None:
+        return None
+
+    # Market implied probability
+    p_market = 1.0 / odds
+
+    # Bayesian shrinkage
+    p_final = (wr_raw * n + p_market * k) / (n + k)
+    return p_final
+
+
+def calc_ev(odds: float, wr_raw: float, n: int):
+    """
+    EV = p_final * odds - 1
+    """
+    p = calc_true_prob(odds, wr_raw, n)
+    if p is None:
+        return None
+    return p * odds - 1.0
+
+
 def fmt_wr(wr: Optional[float]) -> str:
     return "N/A" if wr is None else f"{wr*100:.2f}%"
 
 
-def fmt_ev(wr: Optional[float], odds: Optional[float]):
-    if wr is None or odds is None:
+def fmt_ev(wr: Optional[float], odds: Optional[float], sample_size: Optional[int] = None):
+    if wr is None or odds is None or sample_size is None:
         return "N/A", None
-    ev = (wr * odds) - 1.0
+
+    ev = calc_ev(odds, wr, sample_size)
+    if ev is None:
+        return "N/A", None
     return f"{ev*100:.2f}%", ev
 
 
@@ -441,11 +470,13 @@ class MainWindow(QMainWindow):
         if not isinstance(neu, _QColor): neu = _QColor('gray')
         for odds, live_wr, prem_wr, _live_cnt, _prem_cnt in rows:
             wr = live_wr if bet_type=="Live" else prem_wr
-            ev_str, ev_val = fmt_ev(wr, odds)
+            cnt = _live_cnt if bet_type=="Live" else _prem_cnt
+            ev_str, ev_val = fmt_ev(wr, odds, cnt)
             r = self.table.rowCount(); self.table.insertRow(r)
             
             # Create sortable items
             it_odds = SortableTableWidgetItem(f"{odds:.2f}", odds)
+            it_odds.setData(Qt.ItemDataRole.UserRole, (_live_cnt, _prem_cnt))
             it_live = SortableTableWidgetItem(fmt_wr(live_wr), live_wr)
             it_prem = SortableTableWidgetItem(fmt_wr(prem_wr), prem_wr)
             it_ev = SortableTableWidgetItem(ev_str, ev_val)
@@ -454,7 +485,7 @@ class MainWindow(QMainWindow):
             for c, it in enumerate(cells):
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(r,c,it)
-            color = neu if wr is None else pos if ev_val and ev_val>0 else neg
+            color = neu if wr is None else pos if ev_val is not None and ev_val>0 else neg
             for c in range(4): self.table.item(r,c).setForeground(color)
         self.table.setSortingEnabled(True)
         
@@ -475,21 +506,27 @@ class MainWindow(QMainWindow):
         if not isinstance(neg, _QColor): neg = _QColor('red')
         if not isinstance(neu, _QColor): neu = _QColor('gray')
         for r in range(self.table.rowCount()):
-            odds = float(self.table.item(r,0).text())
+            it_odds = self.table.item(r,0)
+            odds = float(it_odds.text())
+            counts = it_odds.data(Qt.ItemDataRole.UserRole)
+            live_cnt, prem_cnt = counts if counts else (None, None)
+
             def parse_cell(s:str):
                 if s in ("","N/A"): return None
                 return float(s.rstrip('%'))/100.0
             live_wr = parse_cell(self.table.item(r,1).text())
             prem_wr = parse_cell(self.table.item(r,2).text())
             wr = live_wr if bt=="Live" else prem_wr
-            ev_str, ev_val = fmt_ev(wr, odds)
+            cnt = live_cnt if bt=="Live" else prem_cnt
+
+            ev_str, ev_val = fmt_ev(wr, odds, cnt)
             
             it = self.table.item(r,3)
             it.setText(ev_str)
             if isinstance(it, SortableTableWidgetItem):
                 it.sort_value = ev_val
             
-            color = neu if wr is None else pos if ev_val and ev_val>0 else neg
+            color = neu if wr is None else pos if ev_val is not None and ev_val>0 else neg
             for c in range(4): self.table.item(r,c).setForeground(color)
         self.table.setSortingEnabled(True)
         
@@ -515,10 +552,13 @@ class MainWindow(QMainWindow):
                 f"Odds {missing_odds:.2f} is missing {label_type} WR.\n\n"
                 f"Bet {present_odds:.2f} EV: {present_ev*100:.2f}% (WR: {present_wr*100:.2f}%, Count: {cnt})")
             return
-        score_a, score_b = wr_a*odds_a, wr_b*odds_b
-        if score_a>score_b: better=f"Bet {odds_a:.2f} is better"
-        elif score_b>score_a: better=f"Bet {odds_b:.2f} is better"
-        else: better="Both bets are equal"
+        # Compare EVs directly
+        if ev_a is not None and ev_b is not None:
+            if ev_a > ev_b: better=f"Bet {odds_a:.2f} is better"
+            elif ev_b > ev_a: better=f"Bet {odds_b:.2f} is better"
+            else: better="Both bets are equal"
+        else:
+            better="Cannot compare (missing data)"
         ca = 'N/A' if count_a is None else str(count_a); cb = 'N/A' if count_b is None else str(count_b)
         txt=(f"{better} ({bet_type} - {sport})\n\n"+
              f"Bet {odds_a:.2f} EV: {ev_a*100:.2f}% (WR: {wr_a*100:.2f}%, Count: {ca})\n"+
@@ -546,15 +586,18 @@ class MainWindow(QMainWindow):
             cnt_p = live_cnt if bet_type=="Live" else prem_cnt
             if wr_p is None:
                 self.compare_result.setText((f"Odd {odds_a:.2f} not found. " if miss_a else f"Odd {odds_b:.2f} not found. ")+f"Odds {po:.2f} is in data but missing {bet_type} WR."); return
-            ev_p = (wr_p*po)-1.0; cnt_s='N/A' if cnt_p is None else str(cnt_p)
+            ev_p = calc_ev(po, wr_p, cnt_p)
+            if ev_p is None: ev_p = 0.0
+            cnt_s='N/A' if cnt_p is None else str(cnt_p)
             missing = f"Odd {odds_a:.2f} not found." if miss_a else f"Odd {odds_b:.2f} not found."
             self.compare_result.setText(f"{missing}\n\nBet {po:.2f} EV: {ev_p*100:.2f}% (WR: {wr_p*100:.2f}%, Count: {cnt_s})")
             return
         wr_a_live, wr_a_pre, live_cnt_a, prem_cnt_a = self.odds_index[k_a]; wr_b_live, wr_b_pre, live_cnt_b, prem_cnt_b = self.odds_index[k_b]
         wr_a = wr_a_live if bet_type=="Live" else wr_a_pre; wr_b = wr_b_live if bet_type=="Live" else wr_b_pre
-        ev_a = None if wr_a is None else (wr_a*odds_a)-1.0; ev_b = None if wr_b is None else (wr_b*odds_b)-1.0
         cnt_a = live_cnt_a if bet_type=="Live" else prem_cnt_a
         cnt_b = live_cnt_b if bet_type=="Live" else prem_cnt_b
+        ev_a = calc_ev(odds_a, wr_a, cnt_a)
+        ev_b = calc_ev(odds_b, wr_b, cnt_b)
         self.render_compare(odds_a, odds_b, wr_a, wr_b, ev_a, ev_b, self.sport_combo.currentText(), bet_type, cnt_a, cnt_b)
 
     def compare_by_odds(self): self.recompute_comparison_inline()
