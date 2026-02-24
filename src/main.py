@@ -328,7 +328,9 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
         self.setMinimumSize(1150, 600)
         self.data_cache: Dict[str, SheetCacheEntry] = {}
+        self._previous_data_cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
+        self._previous_matchbet_data: List[MatchBetTuple] = []
         self.current_rows: List[RowTuple] = []
         self.odds_index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
         self.dark_mode = True
@@ -425,6 +427,32 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.statistics_panel, 1)
         self.statistics_panel.hide()  # Start hidden
 
+        # --- Change Notification Panel (initially hidden) ---
+        self.changes_panel = QWidget()
+        changes_layout = QVBoxLayout(self.changes_panel)
+        changes_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header with title and dismiss button
+        changes_header = QHBoxLayout()
+        self.changes_title = QLabel("New Data Added")
+        self.changes_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        changes_header.addWidget(self.changes_title)
+        changes_header.addStretch(1)
+        self.btn_dismiss_changes = QPushButton("Dismiss")
+        self.btn_dismiss_changes.setFixedWidth(80)
+        changes_header.addWidget(self.btn_dismiss_changes)
+        changes_layout.addLayout(changes_header)
+        
+        # Text area for changes
+        self.changes_text = QLabel("No new data")
+        self.changes_text.setWordWrap(True)
+        self.changes_text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.changes_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        changes_layout.addWidget(self.changes_text)
+        
+        main_layout.addWidget(self.changes_panel, 0)
+        self.changes_panel.hide()  # Start hidden
+
         # --- Status Bar & Menu ---
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar); self.set_status("Ready")
         act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close); self.menuBar().addAction(act_exit)
@@ -439,6 +467,7 @@ class MainWindow(QMainWindow):
         self.btn_theme.toggled.connect(self.on_theme_toggled)
         self.btn_statistics.clicked.connect(self.show_statistics_panel)
         self.btn_data_table.clicked.connect(self.show_data_table_panel)
+        self.btn_dismiss_changes.clicked.connect(self.dismiss_changes_panel)
 
     # Helpers
     def set_status(self, text: str): self.status_bar.showMessage(text)
@@ -614,6 +643,7 @@ class MainWindow(QMainWindow):
         """Switch to statistics panel view"""
         self.current_view = "statistics"
         self.table.hide()
+        # Keep changes_panel visible - don't hide it
         self.statistics_panel.show()
         
         # Clear existing layout
@@ -735,7 +765,179 @@ class MainWindow(QMainWindow):
         """Switch to data table view"""
         self.current_view = "table"
         self.statistics_panel.hide()
+        # Keep changes_panel visible - don't hide it
         self.table.show()
+
+    def dismiss_changes_panel(self):
+        """Hide the changes notification panel"""
+        self.changes_panel.hide()
+
+    def _detect_odds_changes(self) -> List[Dict]:
+        """Detect changes at the odds level showing previous vs new EV, WR, and count"""
+        if not self._previous_data_cache:
+            return []  # No previous data to compare against
+        
+        changes = []
+        
+        # Check each sport in the new data
+        for sport, new_entry in self.data_cache.items():
+            old_entry = self._previous_data_cache.get(sport)
+            
+            # Build dict of old odds data for quick lookup
+            old_odds_map = {}
+            if old_entry:
+                for row in old_entry.rows:
+                    odds = row[0]  # odds is first element
+                    old_odds_map[odds] = {
+                        'live_wr': row[1],
+                        'prem_wr': row[2], 
+                        'live_cnt': row[3],
+                        'prem_cnt': row[4]
+                    }
+            
+            # Check each new odds entry
+            for row in new_entry.rows:
+                odds, live_wr, prem_wr, live_cnt, prem_cnt = row
+                
+                if odds not in old_odds_map:
+                    # New odds entry - check which type has data
+                    has_live = live_cnt is not None and live_cnt > 0
+                    has_prem = prem_cnt is not None and prem_cnt > 0
+                    
+                    if has_live:
+                        changes.append({
+                            'sport': sport,
+                            'odds': odds,
+                            'bet_type': 'LIVE',
+                            'type': 'new',
+                            'prev_wr': None,
+                            'prev_cnt': None,
+                            'new_wr': live_wr,
+                            'new_cnt': live_cnt
+                        })
+                    if has_prem:
+                        changes.append({
+                            'sport': sport,
+                            'odds': odds,
+                            'bet_type': 'PREMATCH',
+                            'type': 'new',
+                            'prev_wr': None,
+                            'prev_cnt': None,
+                            'new_wr': prem_wr,
+                            'new_cnt': prem_cnt
+                        })
+                else:
+                    # Existing odds - check which type changed
+                    old = old_odds_map[odds]
+                    
+                    # Check LIVE changes
+                    if old['live_cnt'] != live_cnt or old['live_wr'] != live_wr:
+                        changes.append({
+                            'sport': sport,
+                            'odds': odds,
+                            'bet_type': 'LIVE',
+                            'type': 'updated',
+                            'prev_wr': old['live_wr'],
+                            'prev_cnt': old['live_cnt'],
+                            'new_wr': live_wr,
+                            'new_cnt': live_cnt
+                        })
+                    
+                    # Check PREMATCH changes
+                    if old['prem_cnt'] != prem_cnt or old['prem_wr'] != prem_wr:
+                        changes.append({
+                            'sport': sport,
+                            'odds': odds,
+                            'bet_type': 'PREMATCH',
+                            'type': 'updated',
+                            'prev_wr': old['prem_wr'],
+                            'prev_cnt': old['prem_cnt'],
+                            'new_wr': prem_wr,
+                            'new_cnt': prem_cnt
+                        })
+        
+        return changes
+
+    def _calc_ev_display(self, wr: Optional[float], odds: float, cnt: Optional[int]) -> Tuple[str, Optional[float]]:
+        """Calculate EV for display"""
+        if wr is None or cnt is None:
+            return "N/A", None
+        ev = calc_ev(odds, wr, cnt)
+        if ev is None:
+            return "N/A", None
+        return f"{ev*100:.2f}%", ev
+
+    def _format_odds_change(self, change: Dict) -> str:
+        """Format a single odds change for display - showing only the specific bet type that changed"""
+        sport = change['sport']
+        odds = change['odds']
+        ctype = change['type']
+        bet_type = change['bet_type']
+        
+        icon = "🔴" if bet_type == "LIVE" else "⚫"
+        
+        prev_ev_str, prev_ev = self._calc_ev_display(change['prev_wr'], odds, change['prev_cnt'])
+        new_ev_str, new_ev = self._calc_ev_display(change['new_wr'], odds, change['new_cnt'])
+        
+        lines = [f"<b>{sport}</b> | Odds: {odds:.2f} | {icon} {bet_type} ({ctype.upper()})<br>"]
+        
+        if change['prev_cnt'] is not None:
+            lines.append(f"&nbsp;&nbsp;Previous: WR={fmt_wr(change['prev_wr'])}, Count={change['prev_cnt']}, EV={prev_ev_str}<br>")
+        else:
+            lines.append(f"&nbsp;&nbsp;Previous: No data<br>")
+        
+        lines.append(f"&nbsp;&nbsp;<b>Updated:</b> WR={fmt_wr(change['new_wr'])}, Count={change['new_cnt']}, EV={new_ev_str}<br>")
+        
+        if change['prev_cnt'] is not None and prev_ev is not None and new_ev is not None:
+            diff = new_ev - prev_ev
+            diff_str = f"+{diff*100:.2f}%" if diff >= 0 else f"{diff*100:.2f}%"
+            color = "green" if diff >= 0 else "red"
+            lines.append(f"&nbsp;&nbsp;EV Change: <span style='color:{color}'>{diff_str}</span><br>")
+        
+        lines.append("<br>")
+        return "".join(lines)
+
+    def _format_changes_message(self, changes: List[Dict]) -> str:
+        """Format the list of odds changes into a readable message"""
+        if not changes:
+            return "No new data was added."
+        
+        lines = [f"<b>{len(changes)} odds value(s) updated:</b><br><br>"]
+        
+        for change in changes:
+            lines.append(self._format_odds_change(change))
+        
+        return "".join(lines)
+
+    def _display_changes(self, changes: List[Dict]):
+        """Display the changes panel with detected changes only"""
+        if not changes:
+            self.changes_panel.hide()
+            return
+        
+        message = self._format_changes_message(changes)
+        count = len(changes)
+        self.changes_title.setText(f"📊 {count} Odds Value(s) Changed")
+        self.changes_text.setText(message)
+        self.changes_panel.show()
+
+    def _format_current_data_message(self) -> str:
+        """Format message showing current data state"""
+        total_odds = sum(len(entry.rows) for entry in self.data_cache.values())
+        total_bets = len(self.matchbet_data)
+        
+        lines = [f"<b>Data Loaded Successfully</b><br><br>"]
+        lines.append(f"Total Sports: {len(self.data_cache)}<br>")
+        lines.append(f"Total Odds Values: {total_odds}<br>")
+        lines.append(f"Total Bets: {total_bets}<br><br>")
+        
+        # Show summary by sport
+        for sport in sorted(self.data_cache.keys()):
+            entry = self.data_cache[sport]
+            sport_bets = sum((r[3] or 0) + (r[4] or 0) for r in entry.rows)
+            lines.append(f"• <b>{sport}</b>: {len(entry.rows)} odds values ({sport_bets} bets)<br>")
+        
+        return "".join(lines)
 
     def refresh_data(self, force: bool=False):
         sheet = self.sport_combo.currentText()
@@ -750,6 +952,9 @@ class MainWindow(QMainWindow):
             self.set_status("Loaded from cache")
             return
         # Otherwise perform an async refresh from Google Sheets
+        # Store previous data for comparison (always track changes)
+        self._previous_data_cache = self.data_cache.copy()
+        self._previous_matchbet_data = self.matchbet_data.copy()
         self.set_status(f"Refreshing all data..."); self.set_controls_enabled(False)
         t=QThread(); w=RefreshWorker(self.spreadsheet); w.moveToThread(t)
         t.started.connect(w.run)
@@ -761,6 +966,11 @@ class MainWindow(QMainWindow):
         if ok and res:
             cache, data = res
             self.data_cache = cache
+            
+            # Detect and display changes at odds level
+            changes = self._detect_odds_changes()
+            self._display_changes(changes)
+            
             self.matchbet_data = data
             
             # Update sport combo if new sports appeared
