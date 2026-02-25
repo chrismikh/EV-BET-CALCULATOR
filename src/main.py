@@ -87,6 +87,58 @@ def calc_ev(odds: float, wr_raw: float, n: int):
     return p * odds - 1.0
 
 
+def extract_team_from_bet(matchup: str, bet: str) -> Optional[str]:
+    """
+    Given a matchup string (e.g. 'Team A vs Team B') and a bet string
+    (e.g. '2nd Map: +3.5 Team A'), determine which team the bet was placed on.
+    Returns the matched team name or None if no team match is found.
+
+    If the matchup has no 'vs' (e.g. 'Game 6', 'Main Event'), extracts the
+    value after the last ': ' in the bet string (e.g. 'Winner: NRG' -> 'NRG',
+    'Fastest lap: Verstappen' -> 'Verstappen').
+    """
+    if not bet:
+        return None
+
+    # Check if matchup contains 'vs'
+    has_vs = matchup and re.search(r'\s+vs\s+', matchup, flags=re.IGNORECASE)
+
+    if has_vs:
+        # Split matchup on ' vs ' to get team names
+        parts = re.split(r'\s+vs\s+', matchup, flags=re.IGNORECASE)
+        if len(parts) != 2:
+            return None
+
+        team_a = parts[0].strip()
+        team_b = parts[1].strip()
+
+        if not team_a or not team_b:
+            return None
+
+        # Check which team name appears in the bet text
+        a_in_bet = team_a.lower() in bet.lower()
+        b_in_bet = team_b.lower() in bet.lower()
+
+        if a_in_bet and b_in_bet:
+            # Both match — prefer the longer name to avoid false positives
+            return team_a if len(team_a) >= len(team_b) else team_b
+        elif a_in_bet:
+            return team_a
+        elif b_in_bet:
+            return team_b
+        return None
+    else:
+        # No 'vs' in matchup — extract the value after the last ': ' in the bet
+        if ': ' not in bet:
+            return None
+        after_colon = bet.rsplit(': ', 1)[1].strip()
+        if not after_colon:
+            return None
+        # Strip leading handicap/number prefixes like '+3.5 ', '-1.5 '
+        cleaned = re.sub(r'^[+-]?\d+(\.\d+)?\s+', '', after_colon)
+        return cleaned if cleaned else None
+
+
 def fmt_wr(wr: Optional[float]) -> str:
     return "N/A" if wr is None else f"{wr*100:.2f}%"
 
@@ -418,6 +470,15 @@ class MainWindow(QMainWindow):
         self.bettype_combo = QComboBox(); self.bettype_combo.addItems(["Live", "Not Live"]); controls_layout.addWidget(self.bettype_combo)
         sidebar_layout.addLayout(controls_layout)
 
+        # Team selector
+        team_layout = QHBoxLayout()
+        team_layout.addWidget(QLabel("Team:"))
+        self.team_combo = QComboBox()
+        self.team_combo.addItem("All Teams")
+        self.team_combo.setSizePolicy(self.team_combo.sizePolicy())
+        team_layout.addWidget(self.team_combo, 1)
+        sidebar_layout.addLayout(team_layout)
+
         # Tournament selector
         tournament_layout = QHBoxLayout()
         tournament_layout.addWidget(QLabel("Tournament:"))
@@ -530,6 +591,7 @@ class MainWindow(QMainWindow):
         self.entry_odds_a.textChanged.connect(self.recompute_comparison_inline)
         self.entry_odds_b.textChanged.connect(self.recompute_comparison_inline)
         self.btn_theme.toggled.connect(self.on_theme_toggled)
+        self.team_combo.currentTextChanged.connect(self.on_team_change)
         self.btn_statistics.clicked.connect(self.show_statistics_panel)
         self.btn_data_table.clicked.connect(self.show_data_table_panel)
         self.btn_dismiss_changes.clicked.connect(self.dismiss_changes_panel)
@@ -537,7 +599,7 @@ class MainWindow(QMainWindow):
     # Helpers
     def set_status(self, text: str): self.status_bar.showMessage(text)
     def set_controls_enabled(self, enabled: bool):
-        for w in [self.sport_combo,self.bettype_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
+        for w in [self.sport_combo,self.bettype_combo,self.team_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
             w.setEnabled(enabled)
 
     def get_sorted_sports(self) -> List[str]:
@@ -698,11 +760,16 @@ class MainWindow(QMainWindow):
     def on_bet_type_change(self): self.update_ev_only()
 
     def on_sport_change(self):
-        self._populate_tournament_combo(self.sport_combo.currentText())
+        sport = self.sport_combo.currentText()
+        self._populate_tournament_combo(sport)
+        self._populate_team_combo(sport)
         self.refresh_data(False)
 
     def on_tournament_change(self):
-        self._apply_tournament_filter()
+        self._apply_filters()
+
+    def on_team_change(self):
+        self._apply_filters()
 
     def _get_tournaments_for_sport(self, sport: str) -> List[str]:
         """Return normalized tournament names for the given sport, sorted by bet count descending."""
@@ -716,6 +783,17 @@ class MainWindow(QMainWindow):
             counts[norm] = counts.get(norm, 0) + 1
         return sorted(counts.keys(), key=lambda t: counts[t], reverse=True)
 
+    def _get_teams_for_sport(self, sport: str) -> List[str]:
+        """Return team names for the given sport, sorted alphabetically."""
+        teams: set = set()
+        for s, _, matchup, bet, _, _, _ in self.matchbet_data:
+            if s != sport:
+                continue
+            team = extract_team_from_bet(matchup, bet)
+            if team:
+                teams.add(team)
+        return sorted(teams, key=str.lower)
+
     def _populate_tournament_combo(self, sport: str):
         """Repopulate the tournament combo for the given sport."""
         self.tournament_combo.blockSignals(True)
@@ -726,33 +804,56 @@ class MainWindow(QMainWindow):
         self.tournament_combo.setCurrentIndex(0)
         self.tournament_combo.blockSignals(False)
 
-    def _build_tournament_cache(self, sport: str, tournament: str) -> Optional[SheetCacheEntry]:
-        """Filter matchbet_data to a specific sport+tournament and build a SheetCacheEntry."""
-        filtered: List[MatchBetTuple] = []
-        for row in self.matchbet_data:
-            if row[0] != sport:
-                continue
-            norm = normalize_tournament_name(row[1])
-            if norm == tournament:
-                filtered.append(row)
-        if not filtered:
-            return None
-        cache = process_bets_to_cache(filtered)
-        return cache.get(sport)
+    def _populate_team_combo(self, sport: str):
+        """Repopulate the team combo for the given sport."""
+        self.team_combo.blockSignals(True)
+        self.team_combo.clear()
+        self.team_combo.addItem("All Teams")
+        for t in self._get_teams_for_sport(sport):
+            self.team_combo.addItem(t)
+        self.team_combo.setCurrentIndex(0)
+        self.team_combo.blockSignals(False)
 
-    def _apply_tournament_filter(self):
-        """Apply the current tournament selection to update the table and comparison."""
+    def _apply_filters(self):
+        """Apply all active filters (tournament + team) and update the table and comparison."""
         sport = self.sport_combo.currentText()
         tournament = self.tournament_combo.currentText()
+        team = self.team_combo.currentText()
         if not sport or sport not in self.data_cache:
             return
 
-        if tournament == "All Tournaments" or not tournament:
+        all_tournaments = (tournament == "All Tournaments" or not tournament)
+        all_teams = (team == "All Teams" or not team)
+
+        if all_tournaments and all_teams:
+            # No filters — use full sport cache
             entry = self.data_cache[sport]
         else:
-            entry = self._build_tournament_cache(sport, tournament)
+            # Filter matchbet_data then rebuild cache
+            filtered: List[MatchBetTuple] = []
+            for row in self.matchbet_data:
+                if row[0] != sport:
+                    continue
+                # Tournament filter
+                if not all_tournaments:
+                    norm = normalize_tournament_name(row[1])
+                    if norm != tournament:
+                        continue
+                # Team filter — only include bets explicitly placed on the selected team
+                if not all_teams:
+                    bet_team = extract_team_from_bet(row[2], row[3])
+                    if bet_team != team:
+                        continue
+                filtered.append(row)
+            if not filtered:
+                self.current_rows = []
+                self.odds_index = {}
+                self.fill_table([], self.bettype_combo.currentText())
+                self.recompute_comparison_inline()
+                return
+            cache = process_bets_to_cache(filtered)
+            entry = cache.get(sport)
             if entry is None:
-                # No data for this tournament — clear table
                 self.current_rows = []
                 self.odds_index = {}
                 self.fill_table([], self.bettype_combo.currentText())
@@ -1076,7 +1177,7 @@ class MainWindow(QMainWindow):
         if not force and sheet in self.data_cache:
             self.setWindowTitle(f"Google Sheets Bet EV Viewer - {sheet}")
             self.set_status("Loaded from cache")
-            self._apply_tournament_filter()
+            self._apply_filters()
             return
         # Otherwise perform an async refresh from Google Sheets
         # Store previous data for comparison (always track changes)
@@ -1111,14 +1212,15 @@ class MainWindow(QMainWindow):
                 self.sport_combo.setCurrentIndex(0)
             self.sport_combo.blockSignals(False)
             
-            # Repopulate tournament combo for the current sport
+            # Repopulate tournament and team combos for the current sport
             current_sport = self.sport_combo.currentText()
             self._populate_tournament_combo(current_sport)
+            self._populate_team_combo(current_sport)
             
-            # Refresh view using tournament filter
+            # Refresh view using filters
             if current_sport in self.data_cache:
                 self.setWindowTitle(f"Google Sheets Bet EV Viewer - {current_sport}")
-                self._apply_tournament_filter()
+                self._apply_filters()
         else:
             QMessageBox.critical(self, "Error", f"Failed to load data: {info}")
         self.set_controls_enabled(True); self.set_status("Ready")
@@ -1137,7 +1239,8 @@ class MainWindow(QMainWindow):
             first = sports[0]
             self.sport_combo.setCurrentText(first)
             self._populate_tournament_combo(first)
-            self._apply_tournament_filter()
+            self._populate_team_combo(first)
+            self._apply_filters()
 
     def set_matchbet_data(self, data: List[MatchBetTuple]):
         self.matchbet_data = data
