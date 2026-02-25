@@ -125,6 +125,60 @@ def normalize_tournament_name(name: str) -> str:
     # Specific fix for StarLadder abbreviations
     name = name.replace("StarLadder SS", "StarLadder StarSeries")
 
+    # --- VALORANT-specific normalizations ---
+    # Fix common VCL/VLC typo
+    name = re.sub(r'^VLC\b', 'VCL', name)
+    # Unify VCT → Champions Tour
+    name = re.sub(r'^VCT\b', 'Champions Tour', name)
+
+    # Game Changers (VALORANT) – detect before colon split loses the info
+    if re.search(r'\bGame\s+Changers\b|:\s*GC\s', name, re.IGNORECASE):
+        if re.search(r'\bChampionship\b', name, re.IGNORECASE):
+            return "Game Changers Championship"
+        return "Game Changers"
+
+    # Valorant Champions (world championship)
+    if re.search(r'^Valorant\s+Champions\b', name, re.IGNORECASE):
+        return "Valorant Champions"
+
+    # VCT / Champions Tour Masters events
+    if (re.search(r'^Champions Tour\b', name) and re.search(r'\bMasters\b', name, re.IGNORECASE)) \
+            or re.match(r'^Masters\s+\w+', name, re.IGNORECASE):
+        return "VCT Masters"
+
+    # Champions Tour Ascension events
+    if re.search(r'^Champions Tour\b', name) and re.search(r'\bAscension\b', name, re.IGNORECASE):
+        return "Champions Tour Ascension"
+
+    # VCL (Valorant Challengers League) – group all regions together
+    if re.match(r'^VCL\b', name, re.IGNORECASE):
+        return "VCL"
+
+    # --- CS2-specific normalizations ---
+    # IEM (Intel Extreme Masters) – group all city events together
+    if re.match(r'^IEM\b', name):
+        return "IEM"
+
+    # PGL events – group all together
+    if re.match(r'^PGL\b', name):
+        return "PGL"
+
+    # Thunderpick / TP World Championship / TP WC – unify abbreviations
+    if re.match(r'^(Thunderpick|TP)\s+(World\s+Championship|WC)\b', name, re.IGNORECASE):
+        return "Thunderpick World Championship"
+
+    # ESEA – group all variants (Advanced, divisions, etc.)
+    if re.match(r'^ESEA\b', name):
+        return "ESEA"
+
+    # European Pro League – group all variants (Regular Season, Series, Division, etc.)
+    if re.match(r'^European Pro League\b', name):
+        return "European Pro League"
+
+    # CS Asia Championships – preserve "Asia" before region stripping removes it
+    if re.match(r'^CS\s+Asia\b', name, re.IGNORECASE):
+        return "CS Asia Championships"
+
     # 1. Remove text after colons or double slashes (e.g., "BLAST: CQ" -> "BLAST", "Galaxy Battle // Phase 4" -> "Galaxy Battle")
     if '//' in name:
         name = name.split('//')[0]
@@ -151,22 +205,23 @@ def normalize_tournament_name(name: str) -> str:
         r'\b(Asia|Americas|Europe)\s+RMR(\s+[A-Z])?\b',
         r'\bRMR\b',
         r'\bS\d+\b',
-        r'(?<!^)\b(Europe|EU|NA|SA|Asia|Americas|Oceania|CIS|European|South American|North American|Pacific|APAC)\b',
+        r'(?<!^)\b(Europe|EU|NA|SA|Asia|Americas|Oceania|CIS|European|South American|North American|North America|Pacific|APAC|EMEA|MENA|DACH)\b',
         r'\bLCQ\b',
         r'\b(Play-In|Global Finals|Contenders|CQ|Finals?|Groups?|Playoffs?)\b',
         r'\b\d+(?:st|nd|rd|th)?\s+Division\b',
         r'\bDivision\s+\d+\b',
         r'\bSeries\b',
-        r'(?<!^)(?<!\bIEM\s)\b(Atlanta|Katowice|Bangkok|Raleigh|Lisbon)\b',
+        r'(?<!^)\b(Atlanta|Katowice|Bangkok|Raleigh|Lisbon)\b',
         r'\b(Spring|Summer|Fall|Winter)\b',
+        r'\bWeek\b',
         r'\b(I|II|III|IV|V|VI|VII|VIII|IX|X)\b'
     ]
     for pattern in patterns:
         name = re.sub(pattern, '', name, flags=re.IGNORECASE)
 
     # 4. Remove standalone numbers (1-3 digits) that might be season/edition numbers
-    # e.g. "ESL Pro League 21" -> "ESL Pro League", "UFC 302" -> "UFC"
-    name = re.sub(r'\b\d{1,3}\b', '', name)
+    # Only match numbers preceded by whitespace to preserve leading brand numbers (e.g. "500 Casino")
+    name = re.sub(r'(?<=\s)\d{1,3}\b', '', name)
 
     # 5. Clean up extra whitespace and trailing hyphens
     # Replace multiple spaces with single space and trim ends
@@ -363,6 +418,15 @@ class MainWindow(QMainWindow):
         self.bettype_combo = QComboBox(); self.bettype_combo.addItems(["Live", "Not Live"]); controls_layout.addWidget(self.bettype_combo)
         sidebar_layout.addLayout(controls_layout)
 
+        # Tournament selector
+        tournament_layout = QHBoxLayout()
+        tournament_layout.addWidget(QLabel("Tournament:"))
+        self.tournament_combo = QComboBox()
+        self.tournament_combo.addItem("All Tournaments")
+        self.tournament_combo.setSizePolicy(self.tournament_combo.sizePolicy())
+        tournament_layout.addWidget(self.tournament_combo, 1)
+        sidebar_layout.addLayout(tournament_layout)
+
         # Comparison GroupBox
         self.compare_group = QGroupBox("Comparison")
         cg = QVBoxLayout(self.compare_group)
@@ -462,6 +526,7 @@ class MainWindow(QMainWindow):
         self.btn_compare.clicked.connect(self.compare_by_odds)
         self.sport_combo.currentTextChanged.connect(self.on_sport_change)
         self.bettype_combo.currentTextChanged.connect(self.on_bet_type_change)
+        self.tournament_combo.currentTextChanged.connect(self.on_tournament_change)
         self.entry_odds_a.textChanged.connect(self.recompute_comparison_inline)
         self.entry_odds_b.textChanged.connect(self.recompute_comparison_inline)
         self.btn_theme.toggled.connect(self.on_theme_toggled)
@@ -472,7 +537,7 @@ class MainWindow(QMainWindow):
     # Helpers
     def set_status(self, text: str): self.status_bar.showMessage(text)
     def set_controls_enabled(self, enabled: bool):
-        for w in [self.sport_combo,self.bettype_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
+        for w in [self.sport_combo,self.bettype_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
             w.setEnabled(enabled)
 
     def get_sorted_sports(self) -> List[str]:
@@ -631,7 +696,73 @@ class MainWindow(QMainWindow):
 
     def compare_by_odds(self): self.recompute_comparison_inline()
     def on_bet_type_change(self): self.update_ev_only()
-    def on_sport_change(self): self.refresh_data(False)
+
+    def on_sport_change(self):
+        self._populate_tournament_combo(self.sport_combo.currentText())
+        self.refresh_data(False)
+
+    def on_tournament_change(self):
+        self._apply_tournament_filter()
+
+    def _get_tournaments_for_sport(self, sport: str) -> List[str]:
+        """Return normalized tournament names for the given sport, sorted by bet count descending."""
+        counts: Dict[str, int] = {}
+        for s, tournament, _, _, _, _, _ in self.matchbet_data:
+            if s != sport:
+                continue
+            norm = normalize_tournament_name(tournament)
+            if not norm:
+                continue
+            counts[norm] = counts.get(norm, 0) + 1
+        return sorted(counts.keys(), key=lambda t: counts[t], reverse=True)
+
+    def _populate_tournament_combo(self, sport: str):
+        """Repopulate the tournament combo for the given sport."""
+        self.tournament_combo.blockSignals(True)
+        self.tournament_combo.clear()
+        self.tournament_combo.addItem("All Tournaments")
+        for t in self._get_tournaments_for_sport(sport):
+            self.tournament_combo.addItem(t)
+        self.tournament_combo.setCurrentIndex(0)
+        self.tournament_combo.blockSignals(False)
+
+    def _build_tournament_cache(self, sport: str, tournament: str) -> Optional[SheetCacheEntry]:
+        """Filter matchbet_data to a specific sport+tournament and build a SheetCacheEntry."""
+        filtered: List[MatchBetTuple] = []
+        for row in self.matchbet_data:
+            if row[0] != sport:
+                continue
+            norm = normalize_tournament_name(row[1])
+            if norm == tournament:
+                filtered.append(row)
+        if not filtered:
+            return None
+        cache = process_bets_to_cache(filtered)
+        return cache.get(sport)
+
+    def _apply_tournament_filter(self):
+        """Apply the current tournament selection to update the table and comparison."""
+        sport = self.sport_combo.currentText()
+        tournament = self.tournament_combo.currentText()
+        if not sport or sport not in self.data_cache:
+            return
+
+        if tournament == "All Tournaments" or not tournament:
+            entry = self.data_cache[sport]
+        else:
+            entry = self._build_tournament_cache(sport, tournament)
+            if entry is None:
+                # No data for this tournament — clear table
+                self.current_rows = []
+                self.odds_index = {}
+                self.fill_table([], self.bettype_combo.currentText())
+                self.recompute_comparison_inline()
+                return
+
+        self.current_rows = entry.rows
+        self.odds_index = entry.index
+        self.fill_table(self.current_rows, self.bettype_combo.currentText())
+        self.recompute_comparison_inline()
 
     def on_theme_toggled(self, checked: bool):
         self.dark_mode = checked
@@ -943,13 +1074,9 @@ class MainWindow(QMainWindow):
         sheet = self.sport_combo.currentText()
         # If we already have this sheet cached and not forcing, use cache instantly
         if not force and sheet in self.data_cache:
-            entry = self.data_cache[sheet]
-            self.current_rows = entry.rows
-            self.odds_index = entry.index
-            self.fill_table(self.current_rows, self.bettype_combo.currentText())
-            self.recompute_comparison_inline()
             self.setWindowTitle(f"Google Sheets Bet EV Viewer - {sheet}")
             self.set_status("Loaded from cache")
+            self._apply_tournament_filter()
             return
         # Otherwise perform an async refresh from Google Sheets
         # Store previous data for comparison (always track changes)
@@ -984,14 +1111,14 @@ class MainWindow(QMainWindow):
                 self.sport_combo.setCurrentIndex(0)
             self.sport_combo.blockSignals(False)
             
-            # Refresh view
+            # Repopulate tournament combo for the current sport
             current_sport = self.sport_combo.currentText()
+            self._populate_tournament_combo(current_sport)
+            
+            # Refresh view using tournament filter
             if current_sport in self.data_cache:
-                entry = self.data_cache[current_sport]
-                self.current_rows=entry.rows; self.odds_index=entry.index
-                self.fill_table(self.current_rows, self.bettype_combo.currentText())
                 self.setWindowTitle(f"Google Sheets Bet EV Viewer - {current_sport}")
-                self.recompute_comparison_inline()
+                self._apply_tournament_filter()
         else:
             QMessageBox.critical(self, "Error", f"Failed to load data: {info}")
         self.set_controls_enabled(True); self.set_status("Ready")
@@ -1009,9 +1136,8 @@ class MainWindow(QMainWindow):
         if sports:
             first = sports[0]
             self.sport_combo.setCurrentText(first)
-            entry = self.data_cache[first]
-            self.current_rows=entry.rows; self.odds_index=entry.index
-            self.fill_table(self.current_rows, self.bettype_combo.currentText()); self.recompute_comparison_inline()
+            self._populate_tournament_combo(first)
+            self._apply_tournament_filter()
 
     def set_matchbet_data(self, data: List[MatchBetTuple]):
         self.matchbet_data = data
