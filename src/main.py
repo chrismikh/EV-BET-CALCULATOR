@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
     QMessageBox, QDialog, QProgressBar, QStatusBar, QHeaderView,
-    QTreeWidget, QTreeWidgetItem
+    QTreeWidget, QTreeWidgetItem, QTabWidget, QFrame, QFileDialog
 )
 
 import gspread
@@ -427,6 +427,173 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return v1 < v2
 
 
+class SettingsDialog(QDialog):
+    """Settings dialog with Appearance and Data Migration tabs."""
+
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.main_window = parent
+        self.setWindowTitle("Settings")
+        self.setFixedSize(600, 450)
+        self.setModal(True)
+        self._selected_file: Optional[str] = None
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # Tab widget
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        # --- Tab 1: Appearance ---
+        appearance_tab = QWidget()
+        a_layout = QVBoxLayout(appearance_tab)
+        a_layout.setContentsMargins(16, 16, 16, 16)
+        a_layout.setSpacing(12)
+
+        a_title = QLabel("Theme")
+        a_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        a_layout.addWidget(a_title)
+
+        self.lbl_current_theme = QLabel(self._theme_status_text())
+        self.lbl_current_theme.setStyleSheet("font-size: 13px;")
+        a_layout.addWidget(self.lbl_current_theme)
+
+        self.btn_theme = QPushButton()
+        self.btn_theme.setCheckable(True)
+        self.btn_theme.setChecked(self.main_window.dark_mode)
+        self._sync_theme_button()
+        self.btn_theme.toggled.connect(self._on_theme_toggled)
+        a_layout.addWidget(self.btn_theme)
+
+        a_layout.addStretch(1)
+        self.tabs.addTab(appearance_tab, "Appearance")
+
+        # --- Tab 2: Data Migration ---
+        migration_tab = QWidget()
+        m_layout = QVBoxLayout(migration_tab)
+        m_layout.setContentsMargins(16, 16, 16, 16)
+        m_layout.setSpacing(10)
+
+        m_title = QLabel("Import Data from Google Sheets")
+        m_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        m_layout.addWidget(m_title)
+
+        # Drag-and-drop area
+        self.drop_frame = QFrame()
+        self.drop_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.drop_frame.setMinimumHeight(100)
+        self.drop_frame.setStyleSheet(
+            "QFrame { border: 2px dashed #6c7086; border-radius: 10px; }"
+            "QFrame:hover { border-color: #89b4fa; }"
+        )
+        self.drop_frame.setAcceptDrops(True)
+        self.drop_frame.dragEnterEvent = self._drag_enter
+        self.drop_frame.dropEvent = self._drop_event
+        drop_layout = QVBoxLayout(self.drop_frame)
+        drop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_drop = QLabel(
+            "Drag and drop your Match-betting.xlsx file here\nor click Browse below"
+        )
+        self.lbl_drop.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_drop.setStyleSheet("border: none; color: #6c7086; font-size: 13px;")
+        drop_layout.addWidget(self.lbl_drop)
+        m_layout.addWidget(self.drop_frame)
+
+        # Browse button
+        self.btn_browse = QPushButton("Browse Files")
+        self.btn_browse.clicked.connect(self._browse_file)
+        m_layout.addWidget(self.btn_browse)
+
+        # Selected file label
+        self.lbl_selected_file = QLabel("No file selected")
+        self.lbl_selected_file.setStyleSheet("font-size: 12px;")
+        self.lbl_selected_file.setWordWrap(True)
+        m_layout.addWidget(self.lbl_selected_file)
+
+        # Start Migration button
+        self.btn_migrate = QPushButton("Start Migration")
+        self.btn_migrate.setEnabled(False)
+        m_layout.addWidget(self.btn_migrate)
+
+        # Progress bar (hidden initially)
+        self.migration_progress = QProgressBar()
+        self.migration_progress.setRange(0, 100)
+        self.migration_progress.hide()
+        m_layout.addWidget(self.migration_progress)
+
+        # Status label
+        self.lbl_migration_status = QLabel("")
+        self.lbl_migration_status.setWordWrap(True)
+        m_layout.addWidget(self.lbl_migration_status)
+
+        # Warning
+        warning = QLabel(
+            "\u26a0\ufe0f Note: Database migration feature will be implemented "
+            "after database setup is complete. This interface is currently non-functional."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #f38ba8; font-size: 12px; margin-top: 6px;")
+        m_layout.addWidget(warning)
+
+        m_layout.addStretch(1)
+        self.tabs.addTab(migration_tab, "Data Migration")
+
+        # --- Close button ---
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_row.addWidget(btn_close)
+        root.addLayout(close_row)
+
+    # -- helpers --
+    def _theme_status_text(self) -> str:
+        mode = "Dark Mode" if self.main_window.dark_mode else "Light Mode"
+        return f"Current Theme: {mode}"
+
+    def _sync_theme_button(self):
+        dark = self.main_window.dark_mode
+        self.btn_theme.setText(" Light Mode" if dark else " Dark Mode")
+        self.btn_theme.setIcon(
+            QIcon(resource_path("icons/moon.svg" if dark else "icons/sun.svg"))
+        )
+        self.btn_theme.setToolTip("Toggle Dark / Light theme")
+
+    def _on_theme_toggled(self, checked: bool):
+        self.main_window.on_theme_toggled(checked)
+        self.lbl_current_theme.setText(self._theme_status_text())
+        self._sync_theme_button()
+
+    # -- file handling --
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Excel File", "", "Excel Files (*.xlsx)"
+        )
+        if path:
+            self._set_selected_file(path)
+
+    def _set_selected_file(self, path: str):
+        self._selected_file = path
+        name = os.path.basename(path)
+        self.lbl_selected_file.setText(f"{name}\n{path}")
+        self.btn_migrate.setEnabled(True)
+
+    def _drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def _drop_event(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(".xlsx"):
+                self._set_selected_file(path)
+                break
+
+
 class MainWindow(QMainWindow):
     def __init__(self, spreadsheet):
         super().__init__()
@@ -445,8 +612,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect()
         theme_manager.apply_theme(QApplication.instance(), dark=self.dark_mode)
-        self.btn_theme.setChecked(True)
-        self.btn_theme.setText(" Light Mode")
 
     # UI
     def _build_ui(self):
@@ -508,7 +673,6 @@ class MainWindow(QMainWindow):
 
         # Bottom buttons
         self.btn_refresh = QPushButton(" Force Refresh"); self.btn_refresh.setIcon(QIcon(resource_path("icons/refresh-cw.svg"))); sidebar_layout.addWidget(self.btn_refresh)
-        self.btn_theme = QPushButton(" Dark Mode"); self.btn_theme.setIcon(QIcon(resource_path("icons/sun.svg"))); self.btn_theme.setCheckable(True); self.btn_theme.setToolTip("Toggle Dark / Light theme"); sidebar_layout.addWidget(self.btn_theme)
 
         # --- Main Content (Results) ---
         main_content = QWidget(); main_layout = QVBoxLayout(main_content); main_layout.setContentsMargins(10, 10, 10, 0); root_layout.addWidget(main_content, 1)
@@ -580,6 +744,7 @@ class MainWindow(QMainWindow):
 
         # --- Status Bar & Menu ---
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar); self.set_status("Ready")
+        act_settings = QAction("Settings", self); act_settings.triggered.connect(self.open_settings_dialog); self.menuBar().addAction(act_settings)
         act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close); self.menuBar().addAction(act_exit)
 
     def _connect(self):
@@ -590,7 +755,6 @@ class MainWindow(QMainWindow):
         self.tournament_combo.currentTextChanged.connect(self.on_tournament_change)
         self.entry_odds_a.textChanged.connect(self.recompute_comparison_inline)
         self.entry_odds_b.textChanged.connect(self.recompute_comparison_inline)
-        self.btn_theme.toggled.connect(self.on_theme_toggled)
         self.team_combo.currentTextChanged.connect(self.on_team_change)
         self.btn_statistics.clicked.connect(self.show_statistics_panel)
         self.btn_data_table.clicked.connect(self.show_data_table_panel)
@@ -599,7 +763,7 @@ class MainWindow(QMainWindow):
     # Helpers
     def set_status(self, text: str): self.status_bar.showMessage(text)
     def set_controls_enabled(self, enabled: bool):
-        for w in [self.sport_combo,self.bettype_combo,self.team_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare,self.btn_theme]:
+        for w in [self.sport_combo,self.bettype_combo,self.team_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare]:
             w.setEnabled(enabled)
 
     def get_sorted_sports(self) -> List[str]:
@@ -868,8 +1032,10 @@ class MainWindow(QMainWindow):
     def on_theme_toggled(self, checked: bool):
         self.dark_mode = checked
         theme_manager.apply_theme(QApplication.instance(), dark=checked)
-        self.btn_theme.setText(" Light Mode" if checked else " Dark Mode")
-        self.btn_theme.setIcon(QIcon(resource_path("icons/moon.svg" if checked else "icons/sun.svg")))
+
+    def open_settings_dialog(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
 
     def show_statistics_panel(self):
         """Switch to statistics panel view"""

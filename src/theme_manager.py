@@ -159,6 +159,34 @@ QGroupBox::title {{
 }}
 #CompareCard QLabel {{ background-color: transparent; }}
 
+/* Tabs */
+QTabWidget::pane {{
+    border: 1px solid #36364f;
+    border-radius: 8px;
+    background-color: {_DARK_BG.name()};
+    top: -1px;
+}}
+QTabBar::tab {{
+    background-color: #36364f;
+    color: {_GRAY.name()};
+    padding: 8px 18px;
+    border: 1px solid #36364f;
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background-color: {_DARK_BG.name()};
+    color: {_DARK_FG.name()};
+    border-color: #36364f;
+    border-bottom: 1px solid {_DARK_BG.name()};
+}}
+QTabBar::tab:hover:!selected {{
+    background-color: #41415a;
+    color: {_DARK_FG.name()};
+}}
+
 /* Positive/Negative/Neutral Colors */
 .positive {{ color: {_POSITIVE.name()}; }}
 .negative {{ color: {_NEGATIVE.name()}; }}
@@ -235,6 +263,34 @@ QGroupBox::title {{
     padding: 18px;
 }}
 #CompareCard QLabel {{ background-color: transparent; }}
+
+/* Tabs */
+QTabWidget::pane {{
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background-color: {_LIGHT_BG.name()};
+    top: -1px;
+}}
+QTabBar::tab {{
+    background-color: #e5e7eb;
+    color: {_GRAY_LIGHT.name()};
+    padding: 8px 18px;
+    border: 1px solid #e5e7eb;
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background-color: {_LIGHT_BG.name()};
+    color: {_LIGHT_FG.name()};
+    border-color: #e5e7eb;
+    border-bottom: 1px solid {_LIGHT_BG.name()};
+}}
+QTabBar::tab:hover:!selected {{
+    background-color: #d1d5db;
+    color: {_LIGHT_FG.name()};
+}}
 
 /* Positive/Negative/Neutral Colors */
 .positive {{ color: {_POSITIVE_LIGHT.name()}; }}
