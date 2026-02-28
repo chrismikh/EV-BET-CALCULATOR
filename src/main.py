@@ -1985,6 +1985,7 @@ def main():
         win.set_initial_cache(worker.cache)
         win.set_matchbet_data(worker.matchbet_data)
         win.show()
+        QTimer.singleShot(0, lambda: win.refresh_data(force=True))
 
     worker.finished.connect(done)
     QTimer.singleShot(60000, lambda: done(False, "Preloading timed out") if preload_thread.isRunning() else None)
