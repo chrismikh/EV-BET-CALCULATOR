@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sys, os, re, time
+import sys, os, re
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -10,12 +10,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
     QMessageBox, QDialog, QProgressBar, QStatusBar, QHeaderView,
-    QTreeWidget, QTreeWidgetItem, QTabWidget, QFrame, QFileDialog
+    QTreeWidget, QTreeWidgetItem, QTabWidget, QFrame, QFileDialog,
+    QFormLayout, QScrollArea
 )
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from dotenv import load_dotenv
 
 # Ensure project root is in sys.path so we can import from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -23,16 +20,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 try:
     import src.theme_manager as theme_manager
 except ModuleNotFoundError:
-    # Fallback if running directly from src without package context
     import theme_manager as theme_manager
 
-load_dotenv()
-
-JSON_KEYFILE = "my-matchbettings-ev-script-878cbe8fa582.json"
-SPREADSHEET_NAME = "Match betting"
-
-MATCHBET_SHEET_NAME = "MATCHBET"
-MATCHBET_COL_RANGE = "A2:H"
+try:
+    from src.database import DatabaseManager
+except ModuleNotFoundError:
+    from database import DatabaseManager
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
@@ -153,17 +146,17 @@ def fmt_ev(wr: Optional[float], odds: Optional[float], sample_size: Optional[int
     return f"{ev*100:.2f}%", ev
 
 
-def authorize_client():
-    # Try to get credentials from environment variable first
-    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    if env_path and os.path.exists(env_path):
-        path = env_path
-    else:
-        path = resource_path(JSON_KEYFILE)
+def fetch_matchbet_data_from_db(db: DatabaseManager) -> List[MatchBetTuple]:
+    """Fetch settled bets from the local SQLite database.
 
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
-    return gspread.authorize(creds)
+    Returns data in the same MatchBetTuple format used elsewhere:
+    (sport, tournament, matchup, bet, live_status, odds, result)
+    """
+    try:
+        return db.fetch_settled_bets()
+    except Exception as e:
+        print(f"Error fetching data from database: {e}")
+        return []
 
 
 def normalize_tournament_name(name: str) -> str:
@@ -282,42 +275,6 @@ def normalize_tournament_name(name: str) -> str:
     return name
 
 
-def fetch_matchbet_data(spreadsheet) -> List[MatchBetTuple]:
-    try:
-        ws = spreadsheet.worksheet(MATCHBET_SHEET_NAME)
-        try:
-            raw = ws.get(MATCHBET_COL_RANGE)
-        except Exception:
-            raw = ws.batch_get([MATCHBET_COL_RANGE])[0]
-        
-        data: List[MatchBetTuple] = []
-        for r in raw:
-            if len(r) < 8:
-                r = r + [""] * (8 - len(r))
-            
-            sport = r[0].strip()
-            tournament = r[1].strip()
-            matchup = r[2].strip()
-            bet = r[3].strip()
-            live_status = r[4].strip()
-            odds_s = r[5].strip()
-            result = r[7].strip()
-            
-            if not sport: continue
-            if not result: continue
-            
-            try:
-                odds = float(odds_s.replace(',', '.'))
-            except ValueError:
-                continue
-
-            data.append((sport, tournament, matchup, bet, live_status, odds, result))
-        return data
-    except Exception as e:
-        print(f"Error fetching matchbet data: {e}")
-        return []
-
-
 def process_bets_to_cache(bets: List[MatchBetTuple]) -> Dict[str, SheetCacheEntry]:
     agg = {}
     for sport, _, _, _, live_status, odds, result in bets:
@@ -357,18 +314,18 @@ class PreloadWorker(QObject):
     progress = pyqtSignal(str)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
-    def __init__(self, spreadsheet):
+    def __init__(self):
         super().__init__()
-        self.spreadsheet = spreadsheet
+        self.db = DatabaseManager()
         self.cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
 
     def run(self):
         try:
-            self.progress.emit("Fetching MATCHBET data...")
-            self.status.emit("Downloading all bets...")
+            self.progress.emit("Loading data from database...")
+            self.status.emit("Querying settled bets...")
             
-            self.matchbet_data = fetch_matchbet_data(self.spreadsheet)
+            self.matchbet_data = fetch_matchbet_data_from_db(self.db)
             self.status.emit(f"Loaded {len(self.matchbet_data)} bets. Processing...")
             
             self.cache = process_bets_to_cache(self.matchbet_data)
@@ -381,13 +338,13 @@ class PreloadWorker(QObject):
 
 class RefreshWorker(QObject):
     finished = pyqtSignal(bool, str, object)
-    def __init__(self, spreadsheet):
+    def __init__(self):
         super().__init__()
-        self.spreadsheet = spreadsheet
+        self.db = DatabaseManager()
 
     def run(self):
         try:
-            data = fetch_matchbet_data(self.spreadsheet)
+            data = fetch_matchbet_data_from_db(self.db)
             cache = process_bets_to_cache(data)
             self.finished.emit(True, "Refreshed all data", (cache, data))
         except Exception as e:
@@ -427,6 +384,92 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return v1 < v2
 
 
+class MigrationWorker(QObject):
+    """Background worker to import an .xlsx file into the SQLite database."""
+    progress = pyqtSignal(int, int)  # current, total
+    finished = pyqtSignal(bool, str, int, int, int)  # ok, msg, total, settled, pending
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.finished.emit(False, "openpyxl is not installed. Run: pip install openpyxl", 0, 0, 0)
+            return
+        try:
+            wb = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
+            if "MATCHBET" not in wb.sheetnames:
+                self.finished.emit(False, "Sheet 'MATCHBET' not found in the workbook.", 0, 0, 0)
+                wb.close()
+                return
+            ws = wb["MATCHBET"]
+            rows = list(ws.iter_rows(min_row=2, values_only=True))
+            total = len(rows)
+            db = DatabaseManager()
+            db.create_tables()
+            imported = 0
+            settled = 0
+            pending = 0
+            for i, row in enumerate(rows):
+                self.progress.emit(i + 1, total)
+                if len(row) < 6:
+                    continue
+                sport = str(row[0] or "").strip()
+                if not sport:
+                    continue
+                tournament = str(row[1] or "").strip()
+                matchup = str(row[2] or "").strip()
+                bet = str(row[3] or "").strip()
+                live_status = str(row[4] or "").strip() if len(row) > 4 else "NOT LIVE"
+                odds_raw = row[5] if len(row) > 5 else None
+                bet_amount_raw = row[6] if len(row) > 6 else None
+                result_raw = str(row[7] or "").strip() if len(row) > 7 else ""
+                profit_raw = row[8] if len(row) > 8 else None
+
+                try:
+                    odds = float(str(odds_raw).replace(",", ".")) if odds_raw is not None else None
+                except (ValueError, TypeError):
+                    odds = None
+                if odds is None or odds <= 0:
+                    continue
+
+                try:
+                    bet_amount = float(str(bet_amount_raw).replace(",", ".")) if bet_amount_raw not in (None, "") else None
+                except (ValueError, TypeError):
+                    bet_amount = None
+
+                result = result_raw if result_raw else None
+                profit = None
+                if result:
+                    try:
+                        profit = float(str(profit_raw).replace(",", ".")) if profit_raw not in (None, "") else None
+                    except (ValueError, TypeError):
+                        profit = None
+                    settled += 1
+                else:
+                    pending += 1
+
+                db.insert_bet(
+                    sport=sport,
+                    tournament=tournament,
+                    matchup=matchup,
+                    bet=bet,
+                    live_status=live_status if live_status else "NOT LIVE",
+                    odds=odds,
+                    bet_amount=bet_amount,
+                    result=result,
+                    profit=profit,
+                )
+                imported += 1
+            wb.close()
+            self.finished.emit(True, "", imported, settled, pending)
+        except Exception as e:
+            self.finished.emit(False, str(e), 0, 0, 0)
+
+
 class SettingsDialog(QDialog):
     """Settings dialog with Appearance and Data Migration tabs."""
 
@@ -434,9 +477,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.main_window = parent
         self.setWindowTitle("Settings")
-        self.setFixedSize(600, 450)
+        self.setFixedSize(650, 560)
         self.setModal(True)
         self._selected_file: Optional[str] = None
+        self._migration_thread: Optional[QThread] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -478,14 +522,28 @@ class SettingsDialog(QDialog):
         m_layout.setContentsMargins(16, 16, 16, 16)
         m_layout.setSpacing(10)
 
-        m_title = QLabel("Import Data from Google Sheets")
+        m_title = QLabel("Import Data from Excel (.xlsx)")
         m_title.setStyleSheet("font-size: 15px; font-weight: bold;")
         m_layout.addWidget(m_title)
+
+        # Format instructions
+        fmt_info = QLabel(
+            "\U0001f4cb <b>Google Sheet / Excel Format Requirements:</b><br><br>"
+            "Your file must have a sheet named <b>MATCHBET</b> with columns (in order):<br>"
+            "&nbsp;&nbsp;A: Sport &nbsp; B: Tournament &nbsp; C: Matchup &nbsp; D: Bet<br>"
+            "&nbsp;&nbsp;E: Live Status (LIVE or NOT LIVE) &nbsp; F: Odds<br>"
+            "&nbsp;&nbsp;G: Bet Amount &nbsp; H: Result (Win/Lose) &nbsp; I: Profit<br><br>"
+            "\u26a0\ufe0f First row = headers (skipped). Empty Sport rows skipped.<br>"
+            "\u26a0\ufe0f Bets without Result are imported as pending."
+        )
+        fmt_info.setWordWrap(True)
+        fmt_info.setStyleSheet("font-size: 12px;")
+        m_layout.addWidget(fmt_info)
 
         # Drag-and-drop area
         self.drop_frame = QFrame()
         self.drop_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        self.drop_frame.setMinimumHeight(100)
+        self.drop_frame.setMinimumHeight(80)
         self.drop_frame.setStyleSheet(
             "QFrame { border: 2px dashed #6c7086; border-radius: 10px; }"
             "QFrame:hover { border-color: #89b4fa; }"
@@ -496,7 +554,7 @@ class SettingsDialog(QDialog):
         drop_layout = QVBoxLayout(self.drop_frame)
         drop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_drop = QLabel(
-            "Drag and drop your Match-betting.xlsx file here\nor click Browse below"
+            "Drag and drop your .xlsx file here\nor click Browse below"
         )
         self.lbl_drop.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_drop.setStyleSheet("border: none; color: #6c7086; font-size: 13px;")
@@ -517,6 +575,7 @@ class SettingsDialog(QDialog):
         # Start Migration button
         self.btn_migrate = QPushButton("Start Migration")
         self.btn_migrate.setEnabled(False)
+        self.btn_migrate.clicked.connect(self._start_migration)
         m_layout.addWidget(self.btn_migrate)
 
         # Progress bar (hidden initially)
@@ -530,17 +589,41 @@ class SettingsDialog(QDialog):
         self.lbl_migration_status.setWordWrap(True)
         m_layout.addWidget(self.lbl_migration_status)
 
-        # Warning
-        warning = QLabel(
-            "\u26a0\ufe0f Note: Database migration feature will be implemented "
-            "after database setup is complete. This interface is currently non-functional."
-        )
-        warning.setWordWrap(True)
-        warning.setStyleSheet("color: #f38ba8; font-size: 12px; margin-top: 6px;")
-        m_layout.addWidget(warning)
-
         m_layout.addStretch(1)
         self.tabs.addTab(migration_tab, "Data Migration")
+
+        # --- Tab 3: Database Reset ---
+        reset_tab = QWidget()
+        r_layout = QVBoxLayout(reset_tab)
+        r_layout.setContentsMargins(16, 16, 16, 16)
+        r_layout.setSpacing(12)
+
+        r_title = QLabel("Reset Database")
+        r_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        r_layout.addWidget(r_title)
+
+        r_desc = QLabel(
+            "This will permanently delete <b>all bets</b> from the database "
+            "(both settled and pending). This action cannot be undone."
+        )
+        r_desc.setWordWrap(True)
+        r_desc.setStyleSheet("font-size: 13px;")
+        r_layout.addWidget(r_desc)
+
+        self.btn_reset_db = QPushButton("Delete All Data")
+        self.btn_reset_db.setStyleSheet(
+            "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; }"
+            "QPushButton:hover { background-color: #c0392b; }"
+        )
+        self.btn_reset_db.clicked.connect(self._reset_database)
+        r_layout.addWidget(self.btn_reset_db)
+
+        self.lbl_reset_status = QLabel("")
+        self.lbl_reset_status.setWordWrap(True)
+        r_layout.addWidget(self.lbl_reset_status)
+
+        r_layout.addStretch(1)
+        self.tabs.addTab(reset_tab, "Database")
 
         # --- Close button ---
         btn_close = QPushButton("Close")
@@ -593,12 +676,78 @@ class SettingsDialog(QDialog):
                 self._set_selected_file(path)
                 break
 
+    # -- migration --
+    def _start_migration(self):
+        if not self._selected_file or not os.path.isfile(self._selected_file):
+            QMessageBox.warning(self, "File Error", "Selected file does not exist.")
+            return
+        self.btn_migrate.setEnabled(False)
+        self.btn_browse.setEnabled(False)
+        self.migration_progress.setValue(0)
+        self.migration_progress.show()
+        self.lbl_migration_status.setText("Migrating...")
+
+        self._migration_thread = QThread()
+        self._migration_worker = MigrationWorker(self._selected_file)
+        self._migration_worker.moveToThread(self._migration_thread)
+        self._migration_thread.started.connect(self._migration_worker.run)
+        self._migration_worker.progress.connect(self._on_migration_progress)
+        self._migration_worker.finished.connect(self._on_migration_finished)
+        self._migration_thread.start()
+
+    def _on_migration_progress(self, current: int, total: int):
+        if total > 0:
+            self.migration_progress.setValue(int(current / total * 100))
+        self.lbl_migration_status.setText(f"Processing row {current} / {total}...")
+
+    def _on_migration_finished(self, ok: bool, msg: str, total: int, settled: int, pending: int):
+        if self._migration_thread:
+            self._migration_thread.quit()
+            self._migration_thread.wait()
+            self._migration_worker.deleteLater()
+            self._migration_thread = None
+        self.migration_progress.setValue(100 if ok else 0)
+        self.btn_browse.setEnabled(True)
+        if ok:
+            self.lbl_migration_status.setText(
+                f"Successfully migrated {total} bets ({settled} settled, {pending} pending)."
+            )
+            self.btn_migrate.setEnabled(False)
+            # Trigger a data refresh on the main window
+            self.main_window.refresh_data(force=True)
+        else:
+            self.lbl_migration_status.setText(f"Migration failed: {msg}")
+            self.btn_migrate.setEnabled(True)
+
+    # -- database reset --
+    def _reset_database(self):
+        reply = QMessageBox.warning(
+            self,
+            "Confirm Database Reset",
+            "Are you sure you want to delete ALL bets from the database?\n\n"
+            "This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            db = DatabaseManager()
+            count = db.delete_all_bets()
+            self.lbl_reset_status.setText(
+                f"Deleted {count} bet(s). Database is now empty."
+            )
+            self.main_window.refresh_data(force=True)
+        except Exception as e:
+            self.lbl_reset_status.setText(f"Error: {e}")
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, spreadsheet):
+    def __init__(self):
         super().__init__()
-        self.spreadsheet = spreadsheet
-        self.setWindowTitle("Google Sheets Bet EV Viewer")
+        self.db = DatabaseManager()
+        self.db.create_tables()
+        self.setWindowTitle("EV Bet Calculator")
         self.resize(1200, 800)
         self.setMinimumSize(1150, 600)
         self.data_cache: Dict[str, SheetCacheEntry] = {}
@@ -608,7 +757,8 @@ class MainWindow(QMainWindow):
         self.current_rows: List[RowTuple] = []
         self.odds_index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
         self.dark_mode = True
-        self.current_view = "table"  # Track current view: "table" or "statistics"
+        self.current_view = "table"  # "table", "statistics", "add_bet", "pending_bets"
+        self.editing_bet_id: Optional[int] = None  # None = add mode, int = edit/settle mode
         self._build_ui()
         self._connect()
         theme_manager.apply_theme(QApplication.instance(), dark=self.dark_mode)
@@ -668,6 +818,14 @@ class MainWindow(QMainWindow):
         # Data Table Button
         self.btn_data_table = QPushButton("Data Table")
         sidebar_layout.addWidget(self.btn_data_table)
+
+        # Add New Bet Button
+        self.btn_add_bet = QPushButton("Add New Bet")
+        sidebar_layout.addWidget(self.btn_add_bet)
+
+        # Pending Bets Button
+        self.btn_pending_bets = QPushButton("Pending Bets")
+        sidebar_layout.addWidget(self.btn_pending_bets)
         
         sidebar_layout.addStretch(1)
 
@@ -716,6 +874,12 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.statistics_panel, 1)
         self.statistics_panel.hide()  # Start hidden
 
+        # --- Add Bet Panel (initially hidden) ---
+        self._build_add_bet_panel(main_layout)
+
+        # --- Pending Bets Panel (initially hidden) ---
+        self._build_pending_bets_panel(main_layout)
+
         # --- Change Notification Panel (initially hidden) ---
         self.changes_panel = QWidget()
         changes_layout = QVBoxLayout(self.changes_panel)
@@ -758,6 +922,8 @@ class MainWindow(QMainWindow):
         self.team_combo.currentTextChanged.connect(self.on_team_change)
         self.btn_statistics.clicked.connect(self.show_statistics_panel)
         self.btn_data_table.clicked.connect(self.show_data_table_panel)
+        self.btn_add_bet.clicked.connect(self.show_add_bet_panel)
+        self.btn_pending_bets.clicked.connect(self.show_pending_bets_panel)
         self.btn_dismiss_changes.clicked.connect(self.dismiss_changes_panel)
 
     # Helpers
@@ -1041,7 +1207,8 @@ class MainWindow(QMainWindow):
         """Switch to statistics panel view"""
         self.current_view = "statistics"
         self.table.hide()
-        # Keep changes_panel visible - don't hide it
+        self.add_bet_panel.hide()
+        self.pending_bets_panel.hide()
         self.statistics_panel.show()
         
         # Clear existing layout
@@ -1163,8 +1330,384 @@ class MainWindow(QMainWindow):
         """Switch to data table view"""
         self.current_view = "table"
         self.statistics_panel.hide()
-        # Keep changes_panel visible - don't hide it
+        self.add_bet_panel.hide()
+        self.pending_bets_panel.hide()
         self.table.show()
+
+    # ------------------------------------------------------------------
+    # Add Bet Panel
+    # ------------------------------------------------------------------
+    def _build_add_bet_panel(self, parent_layout):
+        """Create the Add Bet / Settle Bet form panel."""
+        self.add_bet_panel = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form_layout = QVBoxLayout(inner)
+        form_layout.setContentsMargins(20, 20, 20, 20)
+        form_layout.setSpacing(10)
+
+        self.add_bet_title = QLabel("Add New Bet")
+        self.add_bet_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        form_layout.addWidget(self.add_bet_title)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        # Sport
+        self.form_sport = QComboBox()
+        self.form_sport.setEditable(True)
+        form.addRow("Sport:", self.form_sport)
+
+        # Tournament
+        self.form_tournament = QLineEdit()
+        form.addRow("Tournament:", self.form_tournament)
+
+        # Matchup
+        self.form_matchup = QLineEdit()
+        self.form_matchup.setPlaceholderText("e.g. Team A vs Team B")
+        form.addRow("Matchup:", self.form_matchup)
+
+        # Bet
+        self.form_bet = QLineEdit()
+        self.form_bet.setPlaceholderText("e.g. Match: Team A")
+        form.addRow("Bet:", self.form_bet)
+
+        # Live Status
+        self.form_live_status = QComboBox()
+        self.form_live_status.addItems(["LIVE", "NOT LIVE"])
+        form.addRow("Live Status:", self.form_live_status)
+
+        # Odds
+        self.form_odds = QLineEdit()
+        self.form_odds.setPlaceholderText("e.g. 1.75")
+        form.addRow("Odds:", self.form_odds)
+
+        # Bet Amount
+        self.form_bet_amount = QLineEdit()
+        self.form_bet_amount.setPlaceholderText("e.g. 10.00")
+        form.addRow("Bet Amount:", self.form_bet_amount)
+
+        # Result
+        self.form_result = QComboBox()
+        self.form_result.addItems(["(Pending)", "Win", "Lose"])
+        form.addRow("Result:", self.form_result)
+
+        # Profit (auto-calculated)
+        self.form_profit = QLineEdit()
+        self.form_profit.setPlaceholderText("Auto-calculated from odds & amount")
+        self.form_profit.setReadOnly(True)
+        form.addRow("Profit:", self.form_profit)
+
+        form_layout.addLayout(form)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.btn_save_bet = QPushButton("Save Bet")
+        self.btn_save_bet.clicked.connect(self.save_bet)
+        btn_row.addWidget(self.btn_save_bet)
+
+        btn_clear = QPushButton("Clear Form")
+        btn_clear.clicked.connect(self.clear_bet_form)
+        btn_row.addWidget(btn_clear)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.show_data_table_panel)
+        btn_row.addWidget(btn_cancel)
+
+        form_layout.addLayout(btn_row)
+        form_layout.addStretch(1)
+
+        scroll.setWidget(inner)
+        panel_layout = QVBoxLayout(self.add_bet_panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.addWidget(scroll)
+        parent_layout.addWidget(self.add_bet_panel, 1)
+        self.add_bet_panel.hide()
+
+        # Connect signals for auto-profit calculation
+        self.form_result.currentTextChanged.connect(self._auto_calc_profit)
+        self.form_odds.textChanged.connect(self._auto_calc_profit)
+        self.form_bet_amount.textChanged.connect(self._auto_calc_profit)
+
+    def _auto_calc_profit(self):
+        """Recalculate profit when result, odds, or bet amount change."""
+        result = self.form_result.currentText()
+        if result == "(Pending)":
+            self.form_profit.clear()
+            return
+        try:
+            odds = float(self.form_odds.text().strip().replace(",", "."))
+            amount = float(self.form_bet_amount.text().strip().replace(",", "."))
+        except (ValueError, AttributeError):
+            self.form_profit.clear()
+            return
+        if result == "Win":
+            profit = (odds - 1.0) * amount
+        else:  # Lose
+            profit = -amount
+        self.form_profit.setText(f"{profit:.2f}")
+
+    def _populate_form_sports(self):
+        """Populate the sport combo in the add-bet form from existing data."""
+        self.form_sport.blockSignals(True)
+        current = self.form_sport.currentText()
+        self.form_sport.clear()
+        sports = sorted(set(
+            s for s, *_ in self.matchbet_data
+        )) if self.matchbet_data else []
+        # Also include sports from db in case matchbet_data is empty
+        try:
+            db_sports = self.db.get_distinct_sports()
+            sports = sorted(set(sports) | set(db_sports))
+        except Exception:
+            pass
+        for s in sports:
+            self.form_sport.addItem(s)
+        if current:
+            self.form_sport.setCurrentText(current)
+        self.form_sport.blockSignals(False)
+
+    def show_add_bet_panel(self):
+        """Switch to add-bet form in add mode."""
+        self.current_view = "add_bet"
+        self.table.hide()
+        self.statistics_panel.hide()
+        self.pending_bets_panel.hide()
+        self.add_bet_panel.show()
+        self._reset_form_to_add_mode()
+
+    def _reset_form_to_add_mode(self):
+        """Reset the form to add-bet mode (clear fields, enable all)."""
+        self.editing_bet_id = None
+        self.add_bet_title.setText("Add New Bet")
+        self.btn_save_bet.setText("Save Bet")
+        self._populate_form_sports()
+
+        # Enable all fields
+        for w in [self.form_sport, self.form_tournament, self.form_matchup,
+                   self.form_bet, self.form_live_status,
+                   self.form_odds, self.form_bet_amount]:
+            w.setEnabled(True)
+
+        self.form_result.setEnabled(True)
+        self.form_profit.setReadOnly(True)
+        self.clear_bet_form()
+
+    def clear_bet_form(self):
+        """Clear all form fields to defaults."""
+        if self.editing_bet_id is None:
+            self.form_sport.setCurrentIndex(0)
+        self.form_tournament.clear()
+        self.form_matchup.clear()
+        self.form_bet.clear()
+        self.form_live_status.setCurrentIndex(0)
+        self.form_odds.clear()
+        self.form_bet_amount.clear()
+        self.form_result.setCurrentIndex(0)
+        self.form_profit.clear()
+
+    def save_bet(self):
+        """Validate and save / update a bet."""
+        sport = self.form_sport.currentText().strip()
+        tournament = self.form_tournament.text().strip()
+        matchup = self.form_matchup.text().strip()
+        bet = self.form_bet.text().strip()
+        live_status = self.form_live_status.currentText()
+        odds_text = self.form_odds.text().strip()
+        amount_text = self.form_bet_amount.text().strip()
+        result_text = self.form_result.currentText()
+        profit_text = self.form_profit.text().strip()
+
+        # --- Validation ---
+        errors: List[str] = []
+        if not sport:
+            errors.append("Sport is required.")
+        if not tournament:
+            errors.append("Tournament is required.")
+        if not matchup:
+            errors.append("Matchup is required.")
+        if not bet:
+            errors.append("Bet is required.")
+
+        # Odds
+        odds: Optional[float] = None
+        try:
+            odds = float(odds_text.replace(",", "."))
+            if odds <= 0:
+                errors.append("Odds must be > 0.")
+        except ValueError:
+            errors.append("Odds must be a valid positive number.")
+
+        # Bet amount (optional but must be valid if given)
+        bet_amount: Optional[float] = None
+        if amount_text:
+            try:
+                bet_amount = float(amount_text.replace(",", "."))
+                if bet_amount < 0:
+                    errors.append("Bet Amount must be >= 0.")
+            except ValueError:
+                errors.append("Bet Amount must be a valid number.")
+
+        # Result / Profit (profit is auto-calculated)
+        is_pending = (result_text == "(Pending)")
+        result: Optional[str] = None
+        profit: Optional[float] = None
+
+        if not is_pending:
+            result = result_text
+            if not profit_text:
+                if not bet_amount:
+                    errors.append("Bet Amount is required to calculate profit.")
+                else:
+                    errors.append("Could not calculate profit – check Odds and Bet Amount.")
+            else:
+                try:
+                    profit = float(profit_text.replace(",", "."))
+                except ValueError:
+                    errors.append("Profit must be a valid number.")
+
+        if self.editing_bet_id is not None and is_pending:
+            errors.append("You must select Win or Lose to settle this bet.")
+
+        if errors:
+            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
+            return
+
+        # --- Save ---
+        try:
+            if self.editing_bet_id is not None:
+                self.db.update_bet(self.editing_bet_id, result, profit)  # type: ignore[arg-type]
+                QMessageBox.information(self, "Success", "Bet settled successfully!")
+                self._reset_form_to_add_mode()
+                self.refresh_data(force=True)
+                self.show_pending_bets_panel()
+            else:
+                self.db.insert_bet(
+                    sport=sport,
+                    tournament=tournament,
+                    matchup=matchup,
+                    bet=bet,
+                    live_status=live_status,
+                    odds=odds,  # type: ignore[arg-type]
+                    bet_amount=bet_amount,
+                    result=result,
+                    profit=profit,
+                )
+                msg = "Bet added successfully!" if result else "Pending bet saved!"
+                QMessageBox.information(self, "Success", msg)
+                self.clear_bet_form()
+                self.refresh_data(force=True)
+                self.show_data_table_panel()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", f"Failed to save bet:\n{e}")
+
+    # ------------------------------------------------------------------
+    # Pending Bets Panel
+    # ------------------------------------------------------------------
+    def _build_pending_bets_panel(self, parent_layout):
+        """Build the pending-bets view with a table and settle buttons."""
+        self.pending_bets_panel = QWidget()
+        p_layout = QVBoxLayout(self.pending_bets_panel)
+        p_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.lbl_pending_count = QLabel("0 pending bet(s)")
+        self.lbl_pending_count.setStyleSheet("font-size: 15px; font-weight: bold;")
+        p_layout.addWidget(self.lbl_pending_count)
+
+        self.pending_table = QTableWidget(0, 10)
+        self.pending_table.setHorizontalHeaderLabels([
+            "ID", "Sport", "Tournament", "Matchup", "Bet",
+            "Live Status", "Odds", "Bet Amount", "Date Created", "Actions"
+        ])
+        self.pending_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.pending_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pending_table.verticalHeader().setVisible(False)
+        ph = self.pending_table.horizontalHeader()
+        ph.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for c in range(1, 9):
+            ph.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+        ph.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
+        p_layout.addWidget(self.pending_table, 1)
+
+        parent_layout.addWidget(self.pending_bets_panel, 1)
+        self.pending_bets_panel.hide()
+
+    def show_pending_bets_panel(self):
+        """Switch to the pending-bets view."""
+        self.current_view = "pending_bets"
+        self.table.hide()
+        self.statistics_panel.hide()
+        self.add_bet_panel.hide()
+        self.pending_bets_panel.show()
+        self.refresh_pending_bets_table()
+
+    def refresh_pending_bets_table(self):
+        """Fetch and display pending bets."""
+        try:
+            rows = self.db.fetch_pending_bets()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load pending bets:\n{e}")
+            return
+        self.lbl_pending_count.setText(f"{len(rows)} pending bet(s)")
+        self.pending_table.setRowCount(0)
+        for row in rows:
+            # row: (id, sport, tournament, matchup, bet,
+            #        live_status, odds, bet_amount, result, profit, date_created)
+            r = self.pending_table.rowCount()
+            self.pending_table.insertRow(r)
+            bid = row[0]
+            self.pending_table.setItem(r, 0, QTableWidgetItem(str(bid)))
+            self.pending_table.setItem(r, 1, QTableWidgetItem(str(row[1])))
+            self.pending_table.setItem(r, 2, QTableWidgetItem(str(row[2])))
+            self.pending_table.setItem(r, 3, QTableWidgetItem(str(row[3])))
+            self.pending_table.setItem(r, 4, QTableWidgetItem(str(row[4])))
+            self.pending_table.setItem(r, 5, QTableWidgetItem(str(row[5])))
+            self.pending_table.setItem(r, 6, QTableWidgetItem(f"{row[6]:.2f}" if row[6] else ""))
+            self.pending_table.setItem(r, 7, QTableWidgetItem(f"{row[7]:.2f}" if row[7] else ""))
+            self.pending_table.setItem(r, 8, QTableWidgetItem(str(row[10] or "")))
+            btn = QPushButton("Settle Bet")
+            btn.clicked.connect(lambda checked, b=row: self._settle_bet(b))
+            self.pending_table.setCellWidget(r, 9, btn)
+
+    def _settle_bet(self, row_data):
+        """Switch to the add-bet form in edit/settle mode for a pending bet."""
+        # row_data: (id, sport, tournament, matchup, bet,
+        #            live_status, odds, bet_amount, result, profit, date_created)
+        self.editing_bet_id = row_data[0]
+        self.current_view = "add_bet"
+        self.table.hide()
+        self.statistics_panel.hide()
+        self.pending_bets_panel.hide()
+        self.add_bet_panel.show()
+
+        self.add_bet_title.setText("Settle Pending Bet")
+        self.btn_save_bet.setText("Update Bet")
+
+        self._populate_form_sports()
+
+        # Fill fields
+        self.form_sport.setCurrentText(str(row_data[1]))
+        self.form_tournament.setText(str(row_data[2]))
+        self.form_matchup.setText(str(row_data[3]))
+        self.form_bet.setText(str(row_data[4]))
+        idx = self.form_live_status.findText(str(row_data[5]))
+        if idx >= 0:
+            self.form_live_status.setCurrentIndex(idx)
+        self.form_odds.setText(f"{row_data[6]:.2f}" if row_data[6] else "")
+        self.form_bet_amount.setText(f"{row_data[7]:.2f}" if row_data[7] else "")
+        self.form_result.setCurrentIndex(0)  # (Pending)
+        self.form_profit.clear()
+
+        # Disable fields that shouldn't change when settling
+        for w in [self.form_sport, self.form_tournament, self.form_matchup,
+                   self.form_bet, self.form_live_status,
+                   self.form_odds, self.form_bet_amount]:
+            w.setEnabled(False)
+
+        # Keep result editable; profit is auto-calculated
+        self.form_result.setEnabled(True)
+        self.form_profit.setReadOnly(True)
 
     def dismiss_changes_panel(self):
         """Hide the changes notification panel"""
@@ -1341,16 +1884,16 @@ class MainWindow(QMainWindow):
         sheet = self.sport_combo.currentText()
         # If we already have this sheet cached and not forcing, use cache instantly
         if not force and sheet in self.data_cache:
-            self.setWindowTitle(f"Google Sheets Bet EV Viewer - {sheet}")
+            self.setWindowTitle(f"EV Bet Calculator - {sheet}")
             self.set_status("Loaded from cache")
             self._apply_filters()
             return
-        # Otherwise perform an async refresh from Google Sheets
+        # Otherwise perform an async refresh from database
         # Store previous data for comparison (always track changes)
         self._previous_data_cache = self.data_cache.copy()
         self._previous_matchbet_data = self.matchbet_data.copy()
         self.set_status(f"Refreshing all data..."); self.set_controls_enabled(False)
-        t=QThread(); w=RefreshWorker(self.spreadsheet); w.moveToThread(t)
+        t=QThread(); w=RefreshWorker(); w.moveToThread(t)
         t.started.connect(w.run)
         w.finished.connect(lambda ok, info, res: self._on_refresh_done(t,w,ok,info,res))
         t.start()
@@ -1385,8 +1928,13 @@ class MainWindow(QMainWindow):
             
             # Refresh view using filters
             if current_sport in self.data_cache:
-                self.setWindowTitle(f"Google Sheets Bet EV Viewer - {current_sport}")
+                self.setWindowTitle(f"EV Bet Calculator - {current_sport}")
                 self._apply_filters()
+            else:
+                # Cache is empty (e.g. after DB reset) – clear visible tables
+                self.setWindowTitle("EV Bet Calculator")
+                self.table.setRowCount(0)
+                self.refresh_pending_bets_table()
         else:
             QMessageBox.critical(self, "Error", f"Failed to load data: {info}")
         self.set_controls_enabled(True); self.set_status("Ready")
@@ -1414,41 +1962,34 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    
-    client = None
-    spreadsheet = None
-    last_error = None
-    max_retries = 3
 
-    for attempt in range(max_retries):
-        try:
-            client = authorize_client()
-            spreadsheet = client.open(SPREADSHEET_NAME)
-            break
-        except Exception as e:
-            last_error = e
-            print(f"Connection attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
+    # Ensure the database is created
+    db = DatabaseManager()
+    db.create_tables()
 
-    if spreadsheet is None:
-        QMessageBox.critical(None, "Startup Error", f"Failed to initialize Google Sheets after {max_retries} attempts: {last_error}")
-        return 1
-
-    win = MainWindow(spreadsheet)
-    dlg = PreloadDialog(); preload_thread = QThread(); worker = PreloadWorker(spreadsheet); worker.moveToThread(preload_thread)
+    win = MainWindow()
+    dlg = PreloadDialog()
+    preload_thread = QThread()
+    worker = PreloadWorker()
+    worker.moveToThread(preload_thread)
     preload_thread.started.connect(worker.run)
-    worker.progress.connect(dlg.update_progress); worker.status.connect(dlg.update_status)
+    worker.progress.connect(dlg.update_progress)
+    worker.status.connect(dlg.update_status)
+
     def done(ok: bool, msg: str):
         preload_thread.quit(); preload_thread.wait(); worker.deleteLater(); dlg.accept()
         if not ok:
-            QMessageBox.critical(win, "Preload Failed", f"Failed to preload data:\n{msg}"); win.close(); return
+            QMessageBox.critical(win, "Preload Failed", f"Failed to preload data:\n{msg}")
+            win.close()
+            return
         win.set_initial_cache(worker.cache)
         win.set_matchbet_data(worker.matchbet_data)
         win.show()
+
     worker.finished.connect(done)
     QTimer.singleShot(60000, lambda: done(False, "Preloading timed out") if preload_thread.isRunning() else None)
-    preload_thread.start(); dlg.exec()
+    preload_thread.start()
+    dlg.exec()
     return app.exec()
 
 
