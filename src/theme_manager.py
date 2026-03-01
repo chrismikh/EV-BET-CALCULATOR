@@ -82,6 +82,12 @@ _DARK_SS = _COMMON + f"""
 QWidget {{ background-color: {_DARK_BG.name()}; color: {_DARK_FG.name()}; }}
 QMainWindow, QDialog {{ background-color: {_DARK_BG.name()}; }}
 
+/* Menu Bar */
+QMenuBar {{ background-color: {_DARK_BG.name()}; color: {_DARK_FG.name()}; }}
+QMenuBar::item {{ padding: 6px 12px; background: transparent; color: {_DARK_FG.name()}; }}
+QMenuBar::item:selected {{ background-color: #41415a; color: {_DARK_FG.name()}; }}
+QMenuBar::item:pressed {{ background-color: #4b4b69; color: {_DARK_FG.name()}; }}
+
 /* Sidebar */
 #Sidebar {{ background-color: {_DARK_BG_ALT.name()}; border-right: 1px solid #36364f; }}
 
@@ -107,8 +113,17 @@ QLineEdit, QComboBox {{
 }}
 /* Ensure sidebar labels don't create square backgrounds */
 #Sidebar QLabel {{ background: transparent; }}
-QComboBox::drop-down {{ border: none; }}
-QComboBox::down-arrow {{ image: url(v); }}
+QComboBox::drop-down {{
+    border: none;
+    width: 24px;
+    subcontrol-position: center right;
+    subcontrol-origin: padding;
+    right: 4px;
+}}
+QComboBox::down-arrow {{
+    image: url({resource_path("icons/arrow-down-white.svg")});
+    width: 12px; height: 12px;
+}}
 
 /* Table and Tree */
 QTableWidget, QTreeWidget {{
@@ -125,21 +140,21 @@ QTableWidget::item, QTreeWidget::item {{ padding: 5px 12px; }}
 QTableWidget::item:alternate, QTreeWidget::item:alternate {{ background-color: #303042; }}
 QHeaderView::section {{
     background-color: #36364f; font-weight: bold;
-    padding: 6px 30px 6px 60px; border: none;
+    padding: 6px; border: none; border-bottom: 1px solid #44465e;
 }}
 QHeaderView::down-arrow {{
     subcontrol-origin: padding;
     subcontrol-position: center right;
     image: url({resource_path("icons/arrow-down-white.svg")});
-    width: 16px; height: 16px;
-    right: 40px;
+    width: 14px; height: 14px;
+    right: 6px;
 }}
 QHeaderView::up-arrow {{
     subcontrol-origin: padding;
     subcontrol-position: center right;
     image: url({resource_path("icons/arrow-up-white.svg")});
-    width: 16px; height: 16px;
-    right: 40px;
+    width: 14px; height: 14px;
+    right: 6px;
 }}
 QTableCornerButton::section {{ background-color: #36364f; }}
 
@@ -213,25 +228,28 @@ QPushButton:checked {{ background-color: {_ACCENT_LIGHT.name()}; color: white; b
 QPushButton:disabled {{
     background-color: #f1f2f4; color: #9ca3af;
     border: 1px solid #e2e5e9;
-QHeaderView::section {{
-    background-color: #f9fafb; font-weight: bold;
-    padding: 6px 30px 6px 60px; border: none; border-bottom: 1px solid #e5e7eb;
 }}
-QHeaderView::down-arrow {{
-    subcontrol-origin: padding;
+
+/* Inputs */
+QLineEdit, QComboBox {{
+    background-color: white; border: 1px solid #d1d5db;
+    padding: 6px 10px; border-radius: 10px;
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 24px;
     subcontrol-position: center right;
+    subcontrol-origin: padding;
+    right: 4px;
+}}
+QComboBox::down-arrow {{
     image: url({resource_path("icons/arrow-down-black.svg")});
-    width: 16px; height: 16px;
-    right: 40px;
+    width: 12px; height: 12px;
 }}
-QHeaderView::up-arrow {{
-    subcontrol-origin: padding;
-    subcontrol-position: center right;
-    image: url({resource_path("icons/arrow-up-black.svg")});
-    width: 16px; height: 16px;
-    right: 40px;
-}}
-QTableCornerButton::section {{ background-color: #f9fafb; }}
+
+/* Table and Tree */
+QTableWidget, QTreeWidget {{
+    gridline-color: transparent;
     background-color: white;
     border: 1px solid #e5e7eb;
     border-radius: 12px;
@@ -244,6 +262,20 @@ QTableWidget::item:alternate, QTreeWidget::item:alternate {{ background-color: #
 QHeaderView::section {{
     background-color: #f9fafb; font-weight: bold;
     padding: 6px; border: none; border-bottom: 1px solid #e5e7eb;
+}}
+QHeaderView::down-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-down-black.svg")});
+    width: 14px; height: 14px;
+    right: 6px;
+}}
+QHeaderView::up-arrow {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    image: url({resource_path("icons/arrow-up-black.svg")});
+    width: 14px; height: 14px;
+    right: 6px;
 }}
 QTableCornerButton::section {{ background-color: #f9fafb; }}
 

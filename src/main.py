@@ -813,19 +813,26 @@ class MainWindow(QMainWindow):
         
         # Statistics Button
         self.btn_statistics = QPushButton("Statistics")
+        self.btn_statistics.setCheckable(True)
         sidebar_layout.addWidget(self.btn_statistics)
         
         # Data Table Button
         self.btn_data_table = QPushButton("Data Table")
+        self.btn_data_table.setCheckable(True)
+        self.btn_data_table.setChecked(True)  # default view
         sidebar_layout.addWidget(self.btn_data_table)
 
         # Add New Bet Button
         self.btn_add_bet = QPushButton("Add New Bet")
+        self.btn_add_bet.setCheckable(True)
         sidebar_layout.addWidget(self.btn_add_bet)
 
         # Pending Bets Button
         self.btn_pending_bets = QPushButton("Pending Bets")
+        self.btn_pending_bets.setCheckable(True)
         sidebar_layout.addWidget(self.btn_pending_bets)
+
+        self._nav_buttons = [self.btn_statistics, self.btn_data_table, self.btn_add_bet, self.btn_pending_bets]
         
         sidebar_layout.addStretch(1)
 
@@ -1203,9 +1210,15 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         dlg.exec()
 
+    def _update_nav_buttons(self, active):
+        """Highlight only the active navigation button."""
+        for btn in self._nav_buttons:
+            btn.setChecked(btn is active)
+
     def show_statistics_panel(self):
         """Switch to statistics panel view"""
         self.current_view = "statistics"
+        self._update_nav_buttons(self.btn_statistics)
         self.table.hide()
         self.add_bet_panel.hide()
         self.pending_bets_panel.hide()
@@ -1329,6 +1342,7 @@ class MainWindow(QMainWindow):
     def show_data_table_panel(self):
         """Switch to data table view"""
         self.current_view = "table"
+        self._update_nav_buttons(self.btn_data_table)
         self.statistics_panel.hide()
         self.add_bet_panel.hide()
         self.pending_bets_panel.hide()
@@ -1471,6 +1485,7 @@ class MainWindow(QMainWindow):
     def show_add_bet_panel(self):
         """Switch to add-bet form in add mode."""
         self.current_view = "add_bet"
+        self._update_nav_buttons(self.btn_add_bet)
         self.table.hide()
         self.statistics_panel.hide()
         self.pending_bets_panel.hide()
@@ -1636,6 +1651,7 @@ class MainWindow(QMainWindow):
     def show_pending_bets_panel(self):
         """Switch to the pending-bets view."""
         self.current_view = "pending_bets"
+        self._update_nav_buttons(self.btn_pending_bets)
         self.table.hide()
         self.statistics_panel.hide()
         self.add_bet_panel.hide()
@@ -1657,18 +1673,30 @@ class MainWindow(QMainWindow):
             r = self.pending_table.rowCount()
             self.pending_table.insertRow(r)
             bid = row[0]
-            self.pending_table.setItem(r, 0, QTableWidgetItem(str(bid)))
-            self.pending_table.setItem(r, 1, QTableWidgetItem(str(row[1])))
-            self.pending_table.setItem(r, 2, QTableWidgetItem(str(row[2])))
-            self.pending_table.setItem(r, 3, QTableWidgetItem(str(row[3])))
-            self.pending_table.setItem(r, 4, QTableWidgetItem(str(row[4])))
-            self.pending_table.setItem(r, 5, QTableWidgetItem(str(row[5])))
-            self.pending_table.setItem(r, 6, QTableWidgetItem(f"{row[6]:.2f}" if row[6] else ""))
-            self.pending_table.setItem(r, 7, QTableWidgetItem(f"{row[7]:.2f}" if row[7] else ""))
-            self.pending_table.setItem(r, 8, QTableWidgetItem(str(row[10] or "")))
+            items = [
+                QTableWidgetItem(str(bid)),
+                QTableWidgetItem(str(row[1])),
+                QTableWidgetItem(str(row[2])),
+                QTableWidgetItem(str(row[3])),
+                QTableWidgetItem(str(row[4])),
+                QTableWidgetItem(str(row[5])),
+                QTableWidgetItem(f"{row[6]:.2f}" if row[6] else ""),
+                QTableWidgetItem(f"{row[7]:.2f}" if row[7] else ""),
+                QTableWidgetItem(str(row[10] or "")),
+            ]
+            for c, it in enumerate(items):
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.pending_table.setItem(r, c, it)
             btn = QPushButton("Settle Bet")
+            btn.setMinimumWidth(90)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #89b4fa; color: #1e1e2e; font-weight: bold; "
+                "padding: 4px 12px; border-radius: 6px; }"
+                "QPushButton:hover { background-color: #74a8f7; }"
+            )
             btn.clicked.connect(lambda checked, b=row: self._settle_bet(b))
             self.pending_table.setCellWidget(r, 9, btn)
+            self.pending_table.setRowHeight(r, 40)
 
     def _settle_bet(self, row_data):
         """Switch to the add-bet form in edit/settle mode for a pending bet."""
@@ -1676,6 +1704,7 @@ class MainWindow(QMainWindow):
         #            live_status, odds, bet_amount, result, profit, date_created)
         self.editing_bet_id = row_data[0]
         self.current_view = "add_bet"
+        self._update_nav_buttons(self.btn_add_bet)
         self.table.hide()
         self.statistics_panel.hide()
         self.pending_bets_panel.hide()
