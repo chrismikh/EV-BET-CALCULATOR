@@ -1,3 +1,9 @@
+# Credentials & Secrets
+client_secrets.json
+token.json
+*firebase-adminsdk*.json
+.env
+
 # Python cache
 __pycache__/
 *.pyc

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QAction, QColor, QIcon
+from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
@@ -146,14 +146,14 @@ def fmt_ev(wr: Optional[float], odds: Optional[float], sample_size: Optional[int
     return f"{ev*100:.2f}%", ev
 
 
-def fetch_matchbet_data_from_db(db: DatabaseManager) -> List[MatchBetTuple]:
-    """Fetch settled bets from the local SQLite database.
+def fetch_matchbet_data_from_db(db: DatabaseManager, force_refresh_network: bool = False) -> List[MatchBetTuple]:
+    """Fetch settled bets from the database.
 
     Returns data in the same MatchBetTuple format used elsewhere:
     (sport, tournament, matchup, bet, live_status, odds, result)
     """
     try:
-        return db.fetch_settled_bets()
+        return db.fetch_settled_bets(force_refresh=force_refresh_network)
     except Exception as e:
         print(f"Error fetching data from database: {e}")
         return []
@@ -314,9 +314,9 @@ class PreloadWorker(QObject):
     progress = pyqtSignal(str)
     status = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
-    def __init__(self):
+    def __init__(self, db: DatabaseManager):
         super().__init__()
-        self.db = DatabaseManager()
+        self.db = db
         self.cache: Dict[str, SheetCacheEntry] = {}
         self.matchbet_data: List[MatchBetTuple] = []
 
@@ -338,13 +338,14 @@ class PreloadWorker(QObject):
 
 class RefreshWorker(QObject):
     finished = pyqtSignal(bool, str, object)
-    def __init__(self):
+    def __init__(self, db: DatabaseManager, force_refresh_network: bool = False):
         super().__init__()
-        self.db = DatabaseManager()
+        self.db = db
+        self.force_refresh_network = force_refresh_network
 
     def run(self):
         try:
-            data = fetch_matchbet_data_from_db(self.db)
+            data = fetch_matchbet_data_from_db(self.db, self.force_refresh_network)
             cache = process_bets_to_cache(data)
             self.finished.emit(True, "Refreshed all data", (cache, data))
         except Exception as e:
@@ -389,9 +390,10 @@ class MigrationWorker(QObject):
     progress = pyqtSignal(int, int)  # current, total
     finished = pyqtSignal(bool, str, int, int, int)  # ok, msg, total, settled, pending
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, db: DatabaseManager):
         super().__init__()
         self.file_path = file_path
+        self.db = db
 
     def run(self):
         try:
@@ -408,7 +410,7 @@ class MigrationWorker(QObject):
             ws = wb["MATCHBET"]
             rows = list(ws.iter_rows(min_row=2, values_only=True))
             total = len(rows)
-            db = DatabaseManager()
+            db = self.db
             db.create_tables()
             imported = 0
             settled = 0
@@ -688,7 +690,7 @@ class SettingsDialog(QDialog):
         self.lbl_migration_status.setText("Migrating...")
 
         self._migration_thread = QThread()
-        self._migration_worker = MigrationWorker(self._selected_file)
+        self._migration_worker = MigrationWorker(self._selected_file, self.main_window.db)
         self._migration_worker.moveToThread(self._migration_thread)
         self._migration_thread.started.connect(self._migration_worker.run)
         self._migration_worker.progress.connect(self._on_migration_progress)
@@ -714,7 +716,7 @@ class SettingsDialog(QDialog):
             )
             self.btn_migrate.setEnabled(False)
             # Trigger a data refresh on the main window
-            self.main_window.refresh_data(force=True)
+            self.main_window.refresh_data(force=True, force_network=True)
         else:
             self.lbl_migration_status.setText(f"Migration failed: {msg}")
             self.btn_migrate.setEnabled(True)
@@ -732,7 +734,7 @@ class SettingsDialog(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
         try:
-            db = DatabaseManager()
+            db = self.main_window.db
             count = db.delete_all_bets()
             self.lbl_reset_status.setText(
                 f"Deleted {count} bet(s). Database is now empty."
@@ -758,7 +760,7 @@ class MainWindow(QMainWindow):
         self.odds_index: Dict[float, Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]] = {}
         self.dark_mode = True
         self.current_view = "table"  # "table", "statistics", "add_bet", "pending_bets"
-        self.editing_bet_id: Optional[int] = None  # None = add mode, int = edit/settle mode
+        self.editing_bet_id: Optional[str] = None  # None = add mode, str = edit/settle mode
         self._build_ui()
         self._connect()
         theme_manager.apply_theme(QApplication.instance(), dark=self.dark_mode)
@@ -919,7 +921,7 @@ class MainWindow(QMainWindow):
         act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close); self.menuBar().addAction(act_exit)
 
     def _connect(self):
-        self.btn_refresh.clicked.connect(lambda: self.refresh_data(force=True))
+        self.btn_refresh.clicked.connect(lambda: self.refresh_data(force=True, force_network=True))
         self.btn_compare.clicked.connect(self.compare_by_odds)
         self.sport_combo.currentTextChanged.connect(self.on_sport_change)
         self.bettype_combo.currentTextChanged.connect(self.on_bet_type_change)
@@ -1909,7 +1911,7 @@ class MainWindow(QMainWindow):
         
         return "".join(lines)
 
-    def refresh_data(self, force: bool=False):
+    def refresh_data(self, force: bool=False, force_network: bool=False):
         sheet = self.sport_combo.currentText()
         # If we already have this sheet cached and not forcing, use cache instantly
         if not force and sheet in self.data_cache:
@@ -1922,7 +1924,7 @@ class MainWindow(QMainWindow):
         self._previous_data_cache = self.data_cache.copy()
         self._previous_matchbet_data = self.matchbet_data.copy()
         self.set_status(f"Refreshing all data..."); self.set_controls_enabled(False)
-        t=QThread(); w=RefreshWorker(); w.moveToThread(t)
+        t=QThread(); w=RefreshWorker(self.db, force_refresh_network=force_network); w.moveToThread(t)
         t.started.connect(w.run)
         w.finished.connect(lambda ok, info, res: self._on_refresh_done(t,w,ok,info,res))
         t.start()
@@ -1999,7 +2001,7 @@ def main():
     win = MainWindow()
     dlg = PreloadDialog()
     preload_thread = QThread()
-    worker = PreloadWorker()
+    worker = PreloadWorker(win.db)
     worker.moveToThread(preload_thread)
     preload_thread.started.connect(worker.run)
     worker.progress.connect(dlg.update_progress)
