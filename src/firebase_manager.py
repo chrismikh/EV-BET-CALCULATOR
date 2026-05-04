@@ -2,9 +2,14 @@ import os
 import json
 import time
 import requests
+import sys
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+
+def resource_path(relative_path):
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
 
 class FirebaseAuthManager:
     """Handles Google OAuth and exchanges it for Firebase Auth token."""
@@ -13,7 +18,7 @@ class FirebaseAuthManager:
         
         # Read API key and Project ID from client_secrets.json or env vars
         try:
-            with open(self.client_secrets_path, "r") as f:
+            with open(resource_path("client_secrets.json")) as f:
                 secrets = json.load(f)
                 web_or_installed = secrets.get("installed", secrets.get("web", {}))
                 self.api_key = web_or_installed.get("firebase_api_key") or os.environ.get("FIREBASE_API_KEY")

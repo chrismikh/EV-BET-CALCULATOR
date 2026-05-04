@@ -167,6 +167,10 @@ def normalize_tournament_name(name: str) -> str:
     if not name:
         return ""
 
+    # Keep Formula 1 grouped under a stable root label.
+    if re.match(r'^Formula\s*1\b', name, re.IGNORECASE):
+        return "Formula 1"
+
     # Specific fix for StarLadder abbreviations
     name = name.replace("StarLadder SS", "StarLadder StarSeries")
 
@@ -175,6 +179,14 @@ def normalize_tournament_name(name: str) -> str:
     name = re.sub(r'^VLC\b', 'VCL', name)
     # Unify VCT → Champions Tour
     name = re.sub(r'^VCT\b', 'Champions Tour', name)
+
+    # VCT Regional Leagues (Americas, EMEA, Pacific, China)
+    match = re.search(r'\bChampions Tour[\s\d:]*\b(Americas|EMEA|Pacific|China)\b', name, re.IGNORECASE)
+    if match:
+        region = match.group(1)
+        if region.lower() == 'emea':
+            return "VCT EMEA"
+        return f"VCT {region.capitalize()}"
 
     # Game Changers (VALORANT) – detect before colon split loses the info
     if re.search(r'\bGame\s+Changers\b|:\s*GC\s', name, re.IGNORECASE):
@@ -273,6 +285,29 @@ def normalize_tournament_name(name: str) -> str:
     name = re.sub(r'\s+', ' ', name).strip(' -')
 
     return name
+
+
+def tournament_filter_labels(name: str) -> List[str]:
+    """Return all tournament labels a row should match in the tournament filter."""
+    base = normalize_tournament_name(name)
+    labels: List[str] = [base] if base else []
+
+    # Formula 1 supports both broad and race-specific filtering.
+    if re.match(r'^Formula\s*1\b', name, re.IGNORECASE):
+        race = re.sub(r'\b(19|20)\d{2}\b', '', name)
+        race = re.sub(r'\s+', ' ', race).strip(' -')
+        if ': ' in race:
+            _, after = race.split(': ', 1)
+            race = f"Formula 1: {after.strip()}"
+        else:
+            race = "Formula 1"
+
+        if "Formula 1" not in labels:
+            labels.insert(0, "Formula 1")
+        if race and race not in labels:
+            labels.append(race)
+
+    return labels
 
 
 def process_bets_to_cache(bets: List[MatchBetTuple]) -> Dict[str, SheetCacheEntry]:
@@ -1116,10 +1151,8 @@ class MainWindow(QMainWindow):
         for s, tournament, _, _, _, _, _ in self.matchbet_data:
             if s != sport:
                 continue
-            norm = normalize_tournament_name(tournament)
-            if not norm:
-                continue
-            counts[norm] = counts.get(norm, 0) + 1
+            for label in tournament_filter_labels(tournament):
+                counts[label] = counts.get(label, 0) + 1
         return sorted(counts.keys(), key=lambda t: counts[t], reverse=True)
 
     def _get_teams_for_sport(self, sport: str) -> List[str]:
@@ -1175,8 +1208,8 @@ class MainWindow(QMainWindow):
                     continue
                 # Tournament filter
                 if not all_tournaments:
-                    norm = normalize_tournament_name(row[1])
-                    if norm != tournament:
+                    labels = tournament_filter_labels(row[1])
+                    if tournament not in labels:
                         continue
                 # Team filter — only include bets explicitly placed on the selected team
                 if not all_teams:
