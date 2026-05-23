@@ -164,6 +164,37 @@ class DatabaseManager:
                     doc["profit"] = float(profit)
                     break
 
+    def update_bet_fields(self, bet_id: str, fields: Dict[str, Any]) -> None:
+        """Update arbitrary fields for a specific bet (used for editing pending bets).
+
+        `fields` is a map of key->value where keys are top-level bet fields
+        (sport, tournament, matchup, bet, live_status, odds, bet_amount, etc.).
+        This method constructs the appropriate updateMask query and issues a
+        PATCH request to Firestore then applies changes to the local cache.
+        """
+        if not fields:
+            return
+
+        # Build updateMask parameters
+        mask_parts = []
+        for k in fields.keys():
+            mask_parts.append(f"updateMask.fieldPaths={k}")
+
+        url = self.auth.get_bets_url(bet_id)
+        if mask_parts:
+            url = url + "?" + "&".join(mask_parts)
+
+        payload = self._to_firestore_fields(fields)
+        self._request_with_backoff("PATCH", url, json=payload)
+
+        # Update cache directly
+        if self._cached_docs is not None:
+            for doc in self._cached_docs:
+                if doc.get("id") == bet_id:
+                    for k, v in fields.items():
+                        doc[k] = v
+                    break
+
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------

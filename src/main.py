@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys, os, re
+from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
     QMessageBox, QDialog, QProgressBar, QStatusBar, QHeaderView,
     QTreeWidget, QTreeWidgetItem, QTabWidget, QFrame, QFileDialog,
-    QFormLayout, QScrollArea
+    QFormLayout, QScrollArea, QInputDialog, QGridLayout
 )
 
 # Ensure project root is in sys.path so we can import from src
@@ -171,6 +172,10 @@ def normalize_tournament_name(name: str) -> str:
     if re.match(r'^Formula\s*1\b', name, re.IGNORECASE):
         return "Formula 1"
 
+    # Map Esports World Cup / EWC variants to a single label
+    if re.search(r'\b(Esports\s*World\s*Cup|EWC)\b', name, re.IGNORECASE):
+        return "EWC"
+
     # Specific fix for StarLadder abbreviations
     name = name.replace("StarLadder SS", "StarLadder StarSeries")
 
@@ -190,9 +195,7 @@ def normalize_tournament_name(name: str) -> str:
 
     # Game Changers (VALORANT) – detect before colon split loses the info
     if re.search(r'\bGame\s+Changers\b|:\s*GC\s', name, re.IGNORECASE):
-        if re.search(r'\bChampionship\b', name, re.IGNORECASE):
-            return "Game Changers Championship"
-        return "Game Changers"
+        return "VCT GC"
 
     # Valorant Champions (world championship)
     if re.search(r'^Valorant\s+Champions\b', name, re.IGNORECASE):
@@ -219,6 +222,10 @@ def normalize_tournament_name(name: str) -> str:
     # PGL events – group all together
     if re.match(r'^PGL\b', name):
         return "PGL"
+
+    # R6S BLAST Major events – group all host-city variants together
+    if re.match(r'^BLAST\s+R6\s+Major\b', name, re.IGNORECASE):
+        return "BLAST R6 Major"
 
     # Thunderpick / TP World Championship / TP WC – unify abbreviations
     if re.match(r'^(Thunderpick|TP)\s+(World\s+Championship|WC)\b', name, re.IGNORECASE):
@@ -956,7 +963,7 @@ class MainWindow(QMainWindow):
         act_exit = QAction("Exit", self); act_exit.triggered.connect(self.close); self.menuBar().addAction(act_exit)
 
     def _connect(self):
-        self.btn_refresh.clicked.connect(lambda: self.refresh_data(force=True, force_network=True))
+        self.btn_refresh.clicked.connect(lambda checked=False: self.refresh_data(force=True, force_network=True))
         self.btn_compare.clicked.connect(self.compare_by_odds)
         self.sport_combo.currentTextChanged.connect(self.on_sport_change)
         self.bettype_combo.currentTextChanged.connect(self.on_bet_type_change)
@@ -1409,13 +1416,23 @@ class MainWindow(QMainWindow):
         form.addRow("Sport:", self.form_sport)
 
         # Tournament
-        self.form_tournament = QLineEdit()
+        self.form_tournament = QComboBox()
+        self.form_tournament.setEditable(True)
         form.addRow("Tournament:", self.form_tournament)
 
         # Matchup
-        self.form_matchup = QLineEdit()
-        self.form_matchup.setPlaceholderText("e.g. Team A vs Team B")
-        form.addRow("Matchup:", self.form_matchup)
+        matchup_layout = QHBoxLayout()
+        self.form_matchup_team_a = QComboBox()
+        self.form_matchup_team_a.setEditable(True)
+        self.form_matchup_team_b = QComboBox()
+        self.form_matchup_team_b.setEditable(True)
+        matchup_layout.addWidget(self.form_matchup_team_a, 1)
+        # Center "vs" text
+        lbl_vs = QLabel("vs")
+        lbl_vs.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        matchup_layout.addWidget(lbl_vs)
+        matchup_layout.addWidget(self.form_matchup_team_b, 1)
+        form.addRow("Matchup:", matchup_layout)
 
         # Bet
         self.form_bet = QLineEdit()
@@ -1461,7 +1478,15 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(btn_clear)
 
         btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.show_data_table_panel)
+        
+        def on_add_bet_cancel():
+            if self.editing_bet_id:
+                self._reset_form_to_add_mode()
+                self.show_pending_bets_panel()
+            else:
+                self.show_data_table_panel()
+
+        btn_cancel.clicked.connect(on_add_bet_cancel)
         btn_row.addWidget(btn_cancel)
 
         form_layout.addLayout(btn_row)
@@ -1478,6 +1503,40 @@ class MainWindow(QMainWindow):
         self.form_result.currentTextChanged.connect(self._auto_calc_profit)
         self.form_odds.textChanged.connect(self._auto_calc_profit)
         self.form_bet_amount.textChanged.connect(self._auto_calc_profit)
+
+        # Connect signal for sport change to update tournament/team dropdowns
+        self.form_sport.currentTextChanged.connect(self._on_form_sport_changed)
+
+    def _on_form_sport_changed(self, sport: str):
+        """Update tournament and team combo boxes when the sport changes."""
+        self.form_tournament.blockSignals(True)
+        self.form_matchup_team_a.blockSignals(True)
+        self.form_matchup_team_b.blockSignals(True)
+
+        current_tournament = self.form_tournament.currentText()
+        current_team_a = self.form_matchup_team_a.currentText()
+        current_team_b = self.form_matchup_team_b.currentText()
+
+        self.form_tournament.clear()
+        self.form_matchup_team_a.clear()
+        self.form_matchup_team_b.clear()
+
+        if sport:
+            tournaments = self._get_tournaments_for_sport(sport)
+            teams = self._get_teams_for_sport(sport)
+            if tournaments:
+                self.form_tournament.addItems(tournaments)
+            if teams:
+                self.form_matchup_team_a.addItems(teams)
+                self.form_matchup_team_b.addItems(teams)
+
+        self.form_tournament.setCurrentText(current_tournament)
+        self.form_matchup_team_a.setCurrentText(current_team_a)
+        self.form_matchup_team_b.setCurrentText(current_team_b)
+
+        self.form_tournament.blockSignals(False)
+        self.form_matchup_team_a.blockSignals(False)
+        self.form_matchup_team_b.blockSignals(False)
 
     def _auto_calc_profit(self):
         """Recalculate profit when result, odds, or bet amount change."""
@@ -1535,9 +1594,10 @@ class MainWindow(QMainWindow):
         self._populate_form_sports()
 
         # Enable all fields
-        for w in [self.form_sport, self.form_tournament, self.form_matchup,
-                   self.form_bet, self.form_live_status,
-                   self.form_odds, self.form_bet_amount]:
+        for w in [self.form_sport, self.form_tournament, 
+                  self.form_matchup_team_a, self.form_matchup_team_b,
+                  self.form_bet, self.form_live_status,
+                  self.form_odds, self.form_bet_amount]:
             w.setEnabled(True)
 
         self.form_result.setEnabled(True)
@@ -1547,9 +1607,10 @@ class MainWindow(QMainWindow):
     def clear_bet_form(self):
         """Clear all form fields to defaults."""
         if self.editing_bet_id is None:
-            self.form_sport.setCurrentIndex(0)
-        self.form_tournament.clear()
-        self.form_matchup.clear()
+            self.form_sport.setCurrentIndex(0) if self.form_sport.count() > 0 else self.form_sport.setCurrentText("")
+        self.form_tournament.setCurrentText("")
+        self.form_matchup_team_a.setCurrentText("")
+        self.form_matchup_team_b.setCurrentText("")
         self.form_bet.clear()
         self.form_live_status.setCurrentIndex(0)
         self.form_odds.clear()
@@ -1560,8 +1621,10 @@ class MainWindow(QMainWindow):
     def save_bet(self):
         """Validate and save / update a bet."""
         sport = self.form_sport.currentText().strip()
-        tournament = self.form_tournament.text().strip()
-        matchup = self.form_matchup.text().strip()
+        tournament = self.form_tournament.currentText().strip()
+        team_a = self.form_matchup_team_a.currentText().strip()
+        team_b = self.form_matchup_team_b.currentText().strip()
+        matchup = f"{team_a} vs {team_b}" if team_a and team_b else (team_a or team_b)
         bet = self.form_bet.text().strip()
         live_status = self.form_live_status.currentText()
         odds_text = self.form_odds.text().strip()
@@ -1617,8 +1680,8 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     errors.append("Profit must be a valid number.")
 
-        if self.editing_bet_id is not None and is_pending:
-            errors.append("You must select Win or Lose to settle this bet.")
+        # If we're editing an existing bet in settle-mode, result must be set.
+        # For edit-mode (keeping Pending), we allow saving changes while result remains Pending.
 
         if errors:
             QMessageBox.warning(self, "Validation Error", "\n".join(errors))
@@ -1627,11 +1690,32 @@ class MainWindow(QMainWindow):
         # --- Save ---
         try:
             if self.editing_bet_id is not None:
-                self.db.update_bet(self.editing_bet_id, result, profit)  # type: ignore[arg-type]
-                QMessageBox.information(self, "Success", "Bet settled successfully!")
-                self._reset_form_to_add_mode()
-                self.refresh_data(force=True)
-                self.show_pending_bets_panel()
+                # If result is still Pending -> update editable fields only
+                if is_pending:
+                    # Build a fields dict to patch
+                    fields: Dict[str, object] = {
+                        "sport": sport,
+                        "tournament": tournament,
+                        "matchup": matchup,
+                        "bet": bet,
+                        "live_status": live_status,
+                        "odds": float(odds) if odds is not None else None,
+                        "bet_amount": float(bet_amount) if bet_amount is not None else None,
+                    }
+                    # Remove None values
+                    fields = {k: v for k, v in fields.items() if v is not None}
+                    self.db.update_bet_fields(self.editing_bet_id, fields)
+                    QMessageBox.information(self, "Success", "Pending bet updated successfully!")
+                    self._reset_form_to_add_mode()
+                    self.refresh_data(force=True)
+                    self.show_pending_bets_panel()
+                else:
+                    # Settling the bet (set result & profit)
+                    self.db.update_bet(self.editing_bet_id, result, profit)  # type: ignore[arg-type]
+                    QMessageBox.information(self, "Success", "Bet settled successfully!")
+                    self._reset_form_to_add_mode()
+                    self.refresh_data(force=True)
+                    self.show_pending_bets_panel()
             else:
                 self.db.insert_bet(
                     sport=sport,
@@ -1656,7 +1740,7 @@ class MainWindow(QMainWindow):
     # Pending Bets Panel
     # ------------------------------------------------------------------
     def _build_pending_bets_panel(self, parent_layout):
-        """Build the pending-bets view with a table and settle buttons."""
+        """Build the pending-bets view with a scroll area of cards and settle buttons."""
         self.pending_bets_panel = QWidget()
         p_layout = QVBoxLayout(self.pending_bets_panel)
         p_layout.setContentsMargins(10, 10, 10, 10)
@@ -1665,20 +1749,22 @@ class MainWindow(QMainWindow):
         self.lbl_pending_count.setStyleSheet("font-size: 15px; font-weight: bold;")
         p_layout.addWidget(self.lbl_pending_count)
 
-        self.pending_table = QTableWidget(0, 10)
-        self.pending_table.setHorizontalHeaderLabels([
-            "ID", "Sport", "Tournament", "Matchup", "Bet",
-            "Live Status", "Odds", "Bet Amount", "Date Created", "Actions"
-        ])
-        self.pending_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.pending_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.pending_table.verticalHeader().setVisible(False)
-        ph = self.pending_table.horizontalHeader()
-        ph.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        for c in range(1, 9):
-            ph.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
-        ph.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
-        p_layout.addWidget(self.pending_table, 1)
+        self.pending_scroll = QScrollArea()
+        self.pending_scroll.setWidgetResizable(True)
+        self.pending_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pending_scroll.setStyleSheet("QScrollArea { border: none; }")
+        
+        self.pending_cards_container = QWidget()
+        self.pending_cards_layout = QGridLayout(self.pending_cards_container)
+        self.pending_cards_layout.setSpacing(10)
+        self.pending_cards_layout.setContentsMargins(0, 0, 0, 0)
+        # Give column 0 and 1 equal width stretch
+        self.pending_cards_layout.setColumnStretch(0, 1)
+        self.pending_cards_layout.setColumnStretch(1, 1)
+        # We will track row inside the loop
+        
+        self.pending_scroll.setWidget(self.pending_cards_container)
+        p_layout.addWidget(self.pending_scroll, 1)
 
         parent_layout.addWidget(self.pending_bets_panel, 1)
         self.pending_bets_panel.hide()
@@ -1694,47 +1780,218 @@ class MainWindow(QMainWindow):
         self.refresh_pending_bets_table()
 
     def refresh_pending_bets_table(self):
-        """Fetch and display pending bets."""
+        """Fetch and display pending bets as cards."""
         try:
             rows = self.db.fetch_pending_bets()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load pending bets:\n{e}")
             return
+        
         self.lbl_pending_count.setText(f"{len(rows)} pending bet(s)")
-        self.pending_table.setRowCount(0)
-        for row in rows:
+        
+        # Clear existing cards
+        while self.pending_cards_layout.count():
+            item = self.pending_cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+                
+        # To push items to top
+        self.pending_cards_layout.setRowStretch(len(rows) // 2 + 1, 1)
+
+        for idx, row in enumerate(rows):
             # row: (id, sport, tournament, matchup, bet,
             #        live_status, odds, bet_amount, result, profit, date_created)
-            r = self.pending_table.rowCount()
-            self.pending_table.insertRow(r)
-            bid = row[0]
-            items = [
-                QTableWidgetItem(str(bid)),
-                QTableWidgetItem(str(row[1])),
-                QTableWidgetItem(str(row[2])),
-                QTableWidgetItem(str(row[3])),
-                QTableWidgetItem(str(row[4])),
-                QTableWidgetItem(str(row[5])),
-                QTableWidgetItem(f"{row[6]:.2f}" if row[6] else ""),
-                QTableWidgetItem(f"{row[7]:.2f}" if row[7] else ""),
-                QTableWidgetItem(str(row[10] or "")),
-            ]
-            for c, it in enumerate(items):
-                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.pending_table.setItem(r, c, it)
-            btn = QPushButton("Settle Bet")
-            btn.setMinimumWidth(90)
-            btn.setStyleSheet(
-                "QPushButton { background-color: #89b4fa; color: #1e1e2e; font-weight: bold; "
-                "padding: 4px 12px; border-radius: 6px; }"
+            card = QFrame()
+            card.setObjectName("MainCard")
+            is_dark = self.dark_mode
+            bg_col = "#313244" if is_dark else "#e5e9f0"
+            inner_bg_col = "#45475a" if is_dark else "#bcc0cc"
+            border_col = "#45475a" if is_dark else "#bcc0cc"
+            text_col = "#cdd6f4" if is_dark else "#4c4f69"
+            
+            card.setStyleSheet(f"""
+                QFrame#MainCard {{
+                    background-color: {bg_col};
+                    border: 1px solid {border_col};
+                    border-radius: 8px;
+                    padding: 8px;
+                }}
+                QLabel {{ border: none; color: {text_col}; background: transparent; }}
+                QFrame#InnerCard {{
+                    background-color: {inner_bg_col};
+                    border-radius: 6px;
+                    padding: 4px;
+                    border: none;
+                }}
+            """)
+            
+            c_layout = QVBoxLayout(card)
+            c_layout.setContentsMargins(10, 10, 10, 10)
+            c_layout.setSpacing(6)
+            
+            def make_wrap_label(text):
+                lbl = QLabel(text)
+                lbl.setWordWrap(True)
+                return lbl
+            
+            # Format Date
+            date_str = row[10]
+            if date_str:
+                try:
+                    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    date_str = dt.strftime("%d.%m.%Y, %H:%M")
+                except ValueError:
+                    pass
+            
+            # Header: Date & Status
+            h_row = QHBoxLayout()
+            lbl_date = QLabel(f"<b>Date:</b> {date_str or 'N/A'}")
+            lbl_status = QLabel(f"<b>Status:</b> {row[5]}")
+            h_row.addWidget(lbl_date)
+            h_row.addStretch(1)
+            h_row.addWidget(lbl_status)
+            c_layout.addLayout(h_row)
+            
+            # Inner Container for Sport, Tournament, Matchup
+            inner_card = QFrame()
+            inner_card.setObjectName("InnerCard")
+            inner_layout = QVBoxLayout(inner_card)
+            inner_layout.setContentsMargins(6, 6, 6, 6)
+            inner_layout.setSpacing(4)
+            
+            lbl_sport = make_wrap_label(f"<b>Sport:</b> {row[1]}")
+            lbl_tourney = make_wrap_label(f"<b>Tournament:</b> {row[2]}")
+            lbl_matchup = make_wrap_label(f"{row[3]}")
+            
+            inner_layout.addWidget(lbl_sport)
+            inner_layout.addWidget(lbl_tourney)
+            inner_layout.addWidget(lbl_matchup)
+            
+            c_layout.addWidget(inner_card)
+            
+            lbl_bet = make_wrap_label(f"<b>{row[4]}</b>")
+            lbl_bet.setStyleSheet(f"font-size: 15px; color: {text_col}; background: transparent;")
+            c_layout.addWidget(lbl_bet)
+            
+            # Odds & Amount
+            bet_row = QHBoxLayout()
+            lbl_odds = make_wrap_label(f"<b>Odds:</b> {row[6]:.2f}" if row[6] else "<b>Odds:</b> N/A")
+            lbl_amount = make_wrap_label(f"<b>Amount:</b> {row[7]:.2f}" if row[7] else "<b>Amount:</b> N/A")
+            bet_row.addWidget(lbl_odds)
+            bet_row.addWidget(lbl_amount)
+            bet_row.addStretch(1)
+            c_layout.addLayout(bet_row)
+            
+            # Action Buttons
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            
+            btn_edit = QPushButton("Edit")
+            btn_edit.setMinimumWidth(60)
+            btn_edit.setStyleSheet(
+                "QPushButton { background-color: #ffd166; color: #1e1e2e; font-weight: bold; padding: 4px 16px; border-radius: 6px; border: none; }"
+                "QPushButton:hover { background-color: #ffcf80; }"
+            )
+            btn_edit.clicked.connect(lambda checked, b=row: self._edit_pending_bet(b))
+
+            btn_settle = QPushButton("Settle")
+            btn_settle.setMinimumWidth(70)
+            btn_settle.setStyleSheet(
+                "QPushButton { background-color: #89b4fa; color: #1e1e2e; font-weight: bold; padding: 4px 16px; border-radius: 6px; border: none; }"
                 "QPushButton:hover { background-color: #74a8f7; }"
             )
-            btn.clicked.connect(lambda checked, b=row: self._settle_bet(b))
-            self.pending_table.setCellWidget(r, 9, btn)
-            self.pending_table.setRowHeight(r, 40)
+            btn_settle.clicked.connect(lambda checked, b=row: self._settle_bet(b))
+            
+            btn_row.addWidget(btn_edit)
+            btn_row.addWidget(btn_settle)
+            c_layout.addLayout(btn_row)
+            
+            row_idx = idx // 2
+            col_idx = idx % 2
+            self.pending_cards_layout.addWidget(card, row_idx, col_idx)
 
     def _settle_bet(self, row_data):
-        """Switch to the add-bet form in edit/settle mode for a pending bet."""
+        """Open a small dialog to quickly settle a pending bet (Win / Lose)."""
+        # row_data: (id, sport, tournament, matchup, bet,
+        #            live_status, odds, bet_amount, result, profit, date_created)
+        bid = row_data[0]
+        sport = str(row_data[1])
+        tournament = str(row_data[2])
+        matchup = str(row_data[3])
+        bet_text = str(row_data[4])
+        odds = float(row_data[6] or 0.0)
+        bet_amount = float(row_data[7] or 0.0)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settle Bet")
+        dlg.setModal(True)
+        dlg.setFixedSize(520, 220)
+        layout = QVBoxLayout(dlg)
+
+        amount_str = f"{bet_amount:.2f}" if bet_amount else "N/A"
+        info = QLabel(
+            f"<b>Sport:</b> {sport}<br>"
+            f"<b>Tournament:</b> {tournament}<br>"
+            f"<b>Matchup:</b> {matchup}<br>"
+            f"<b>Bet:</b> {bet_text}<br>"
+            f"<b>Odds:</b> {odds:.2f}   <b>Amount:</b> {amount_str}"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+
+        btn_win = QPushButton("Win")
+        btn_win.setStyleSheet("QPushButton { background-color: #2ecc71; color: white; font-weight: bold; padding: 6px 18px; border-radius: 6px; }")
+        btn_lose = QPushButton("Lose")
+        btn_lose.setStyleSheet("QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 6px 18px; border-radius: 6px; }")
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet("QPushButton { padding: 6px 12px; }")
+
+        def ensure_amount() -> Optional[float]:
+            nonlocal bet_amount
+            if bet_amount and bet_amount > 0:
+                return bet_amount
+            val, ok = QInputDialog.getDouble(self, "Bet Amount", "Enter bet amount:", 0.0, 0.0, 1000000.0, 2)
+            if not ok:
+                return None
+            bet_amount = float(val)
+            return bet_amount
+
+        def do_settle(is_win: bool):
+            amt = ensure_amount()
+            if amt is None:
+                return
+            if is_win:
+                profit = round(odds * amt - amt, 2)
+                result = "Win"
+            else:
+                profit = round(-amt, 2)
+                result = "Lose"
+            try:
+                self.db.update_bet(bid, result, profit)
+                QMessageBox.information(self, "Success", f"Bet settled as {result} (Profit: {profit:.2f})")
+                dlg.accept()
+                # Refresh UI
+                self.refresh_data(force=True)
+                self.show_pending_bets_panel()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to settle bet:\n{e}")
+
+        btn_win.clicked.connect(lambda checked: do_settle(True))
+        btn_lose.clicked.connect(lambda checked: do_settle(False))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        btn_row.addWidget(btn_win)
+        btn_row.addWidget(btn_lose)
+        btn_row.addWidget(btn_cancel)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _edit_pending_bet(self, row_data):
+        """Open the add-bet form in editable mode for a pending bet (allow changing sport, matchup, odds, etc.)."""
         # row_data: (id, sport, tournament, matchup, bet,
         #            live_status, odds, bet_amount, result, profit, date_created)
         self.editing_bet_id = row_data[0]
@@ -1745,31 +2002,44 @@ class MainWindow(QMainWindow):
         self.pending_bets_panel.hide()
         self.add_bet_panel.show()
 
-        self.add_bet_title.setText("Settle Pending Bet")
+        self.add_bet_title.setText("Edit Pending Bet")
         self.btn_save_bet.setText("Update Bet")
 
         self._populate_form_sports()
 
-        # Fill fields
+        # Fill fields (keep all editable)
         self.form_sport.setCurrentText(str(row_data[1]))
-        self.form_tournament.setText(str(row_data[2]))
-        self.form_matchup.setText(str(row_data[3]))
+        self.form_tournament.setCurrentText(str(row_data[2]))
+        
+        matchup_str = str(row_data[3])
+        team_a, team_b = "", ""
+        if " vs " in matchup_str:
+            parts = matchup_str.split(" vs ", 1)
+            team_a = parts[0].strip()
+            if len(parts) > 1:
+                team_b = parts[1].strip()
+        else:
+            team_a = matchup_str
+            
+        self.form_matchup_team_a.setCurrentText(team_a)
+        self.form_matchup_team_b.setCurrentText(team_b)
+        
         self.form_bet.setText(str(row_data[4]))
         idx = self.form_live_status.findText(str(row_data[5]))
         if idx >= 0:
             self.form_live_status.setCurrentIndex(idx)
         self.form_odds.setText(f"{row_data[6]:.2f}" if row_data[6] else "")
         self.form_bet_amount.setText(f"{row_data[7]:.2f}" if row_data[7] else "")
-        self.form_result.setCurrentIndex(0)  # (Pending)
+        self.form_result.setCurrentIndex(0)  # keep as Pending
         self.form_profit.clear()
 
-        # Disable fields that shouldn't change when settling
-        for w in [self.form_sport, self.form_tournament, self.form_matchup,
-                   self.form_bet, self.form_live_status,
-                   self.form_odds, self.form_bet_amount]:
-            w.setEnabled(False)
+        # Ensure fields are enabled for editing
+        for w in [self.form_sport, self.form_tournament, 
+                  self.form_matchup_team_a, self.form_matchup_team_b,
+                  self.form_bet, self.form_live_status,
+                  self.form_odds, self.form_bet_amount]:
+            w.setEnabled(True)
 
-        # Keep result editable; profit is auto-calculated
         self.form_result.setEnabled(True)
         self.form_profit.setReadOnly(True)
 
