@@ -5,14 +5,14 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QDate
+from PyQt6.QtGui import QAction, QIcon, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QComboBox, QPushButton, QGroupBox, QLineEdit,
     QMessageBox, QDialog, QProgressBar, QStatusBar, QHeaderView,
     QTreeWidget, QTreeWidgetItem, QTabWidget, QFrame, QFileDialog,
-    QFormLayout, QScrollArea, QInputDialog, QGridLayout
+    QFormLayout, QScrollArea, QInputDialog, QGridLayout, QDateEdit, QSizePolicy
 )
 
 # Ensure project root is in sys.path so we can import from src
@@ -30,7 +30,7 @@ except ModuleNotFoundError:
 
 # RowTuple now stores: (odds, live_wr, prematch_wr, live_bet_count, prematch_bet_count)
 RowTuple = Tuple[float, Optional[float], Optional[float], Optional[int], Optional[int]]
-MatchBetTuple = Tuple[str, str, str, str, str, float, str]
+MatchBetTuple = Tuple[str, str, str, str, str, float, str, str]
 
 
 @dataclass
@@ -151,7 +151,7 @@ def fetch_matchbet_data_from_db(db: DatabaseManager, force_refresh_network: bool
     """Fetch settled bets from the database.
 
     Returns data in the same MatchBetTuple format used elsewhere:
-    (sport, tournament, matchup, bet, live_status, odds, result)
+    (sport, tournament, matchup, bet, live_status, odds, result, provider)
     """
     try:
         return db.fetch_settled_bets(force_refresh=force_refresh_network)
@@ -239,6 +239,10 @@ def normalize_tournament_name(name: str) -> str:
     if re.match(r'^European Pro League\b', name):
         return "European Pro League"
 
+    # LCK – group all variants (Season, Challengers, etc.)
+    if re.match(r'^LCK\b', name, re.IGNORECASE):
+        return "LCK"
+
     # CS Asia Championships – preserve "Asia" before region stripping removes it
     if re.match(r'^CS\s+Asia\b', name, re.IGNORECASE):
         return "CS Asia Championships"
@@ -319,7 +323,7 @@ def tournament_filter_labels(name: str) -> List[str]:
 
 def process_bets_to_cache(bets: List[MatchBetTuple]) -> Dict[str, SheetCacheEntry]:
     agg = {}
-    for sport, _, _, _, live_status, odds, result in bets:
+    for sport, _, _, _, live_status, odds, result, _provider in bets:
         if sport not in agg: agg[sport] = {}
         k = round_odds_key(odds)
         if k is None: continue
@@ -472,6 +476,8 @@ class MigrationWorker(QObject):
                 bet_amount_raw = row[6] if len(row) > 6 else None
                 result_raw = str(row[7] or "").strip() if len(row) > 7 else ""
                 profit_raw = row[8] if len(row) > 8 else None
+                provider_raw = str(row[9] or "").strip() if len(row) > 9 else ""
+                provider = provider_raw or "BetBy"
 
                 try:
                     odds = float(str(odds_raw).replace(",", ".")) if odds_raw is not None else None
@@ -502,6 +508,7 @@ class MigrationWorker(QObject):
                     matchup=matchup,
                     bet=bet,
                     live_status=live_status if live_status else "NOT LIVE",
+                    provider=provider,
                     odds=odds,
                     bet_amount=bet_amount,
                     result=result,
@@ -576,7 +583,8 @@ class SettingsDialog(QDialog):
             "Your file must have a sheet named <b>MATCHBET</b> with columns (in order):<br>"
             "&nbsp;&nbsp;A: Sport &nbsp; B: Tournament &nbsp; C: Matchup &nbsp; D: Bet<br>"
             "&nbsp;&nbsp;E: Live Status (LIVE or NOT LIVE) &nbsp; F: Odds<br>"
-            "&nbsp;&nbsp;G: Bet Amount &nbsp; H: Result (Win/Lose) &nbsp; I: Profit<br><br>"
+            "&nbsp;&nbsp;G: Bet Amount &nbsp; H: Result (Win/Lose) &nbsp; I: Profit<br>"
+            "&nbsp;&nbsp;J: Provider (optional, defaults to BetBy)<br><br>"
             "\u26a0\ufe0f First row = headers (skipped). Empty Sport rows skipped.<br>"
             "\u26a0\ufe0f Bets without Result are imported as pending."
         )
@@ -803,6 +811,8 @@ class MainWindow(QMainWindow):
         self.dark_mode = True
         self.current_view = "table"  # "table", "statistics", "add_bet", "pending_bets"
         self.editing_bet_id: Optional[str] = None  # None = add mode, str = edit/settle mode
+        self._statistics_panel_built = False
+        self._statistics_refresh_pending = False
         self._build_ui()
         self._connect()
         theme_manager.apply_theme(QApplication.instance(), dark=self.dark_mode)
@@ -846,6 +856,15 @@ class MainWindow(QMainWindow):
         self.tournament_combo.setSizePolicy(self.tournament_combo.sizePolicy())
         tournament_layout.addWidget(self.tournament_combo, 1)
         sidebar_layout.addLayout(tournament_layout)
+
+        # Provider selector
+        provider_layout = QHBoxLayout()
+        provider_layout.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("All Providers")
+        self.provider_combo.setSizePolicy(self.provider_combo.sizePolicy())
+        provider_layout.addWidget(self.provider_combo, 1)
+        sidebar_layout.addLayout(provider_layout)
 
         # Comparison GroupBox
         self.compare_group = QGroupBox("Comparison")
@@ -968,10 +987,11 @@ class MainWindow(QMainWindow):
         self.sport_combo.currentTextChanged.connect(self.on_sport_change)
         self.bettype_combo.currentTextChanged.connect(self.on_bet_type_change)
         self.tournament_combo.currentTextChanged.connect(self.on_tournament_change)
+        self.provider_combo.currentTextChanged.connect(self.on_provider_change)
         self.entry_odds_a.textChanged.connect(self.recompute_comparison_inline)
         self.entry_odds_b.textChanged.connect(self.recompute_comparison_inline)
         self.team_combo.currentTextChanged.connect(self.on_team_change)
-        self.btn_statistics.clicked.connect(self.show_statistics_panel)
+        self.btn_statistics.clicked.connect(lambda checked=False: self.show_statistics_panel())
         self.btn_data_table.clicked.connect(self.show_data_table_panel)
         self.btn_add_bet.clicked.connect(self.show_add_bet_panel)
         self.btn_pending_bets.clicked.connect(self.show_pending_bets_panel)
@@ -980,7 +1000,7 @@ class MainWindow(QMainWindow):
     # Helpers
     def set_status(self, text: str): self.status_bar.showMessage(text)
     def set_controls_enabled(self, enabled: bool):
-        for w in [self.sport_combo,self.bettype_combo,self.team_combo,self.tournament_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare]:
+        for w in [self.sport_combo,self.bettype_combo,self.team_combo,self.tournament_combo,self.provider_combo,self.btn_refresh,self.entry_odds_a,self.entry_odds_b,self.btn_compare]:
             w.setEnabled(enabled)
 
     def get_sorted_sports(self) -> List[str]:
@@ -1144,6 +1164,7 @@ class MainWindow(QMainWindow):
         sport = self.sport_combo.currentText()
         self._populate_tournament_combo(sport)
         self._populate_team_combo(sport)
+        self._populate_provider_combo(sport)
         self.refresh_data(False)
 
     def on_tournament_change(self):
@@ -1152,10 +1173,13 @@ class MainWindow(QMainWindow):
     def on_team_change(self):
         self._apply_filters()
 
+    def on_provider_change(self):
+        self._apply_filters()
+
     def _get_tournaments_for_sport(self, sport: str) -> List[str]:
         """Return normalized tournament names for the given sport, sorted by bet count descending."""
         counts: Dict[str, int] = {}
-        for s, tournament, _, _, _, _, _ in self.matchbet_data:
+        for s, tournament, _, _, _, _, _, _ in self.matchbet_data:
             if s != sport:
                 continue
             for label in tournament_filter_labels(tournament):
@@ -1165,13 +1189,24 @@ class MainWindow(QMainWindow):
     def _get_teams_for_sport(self, sport: str) -> List[str]:
         """Return team names for the given sport, sorted alphabetically."""
         teams: set = set()
-        for s, _, matchup, bet, _, _, _ in self.matchbet_data:
+        for s, _, matchup, bet, _, _, _, _ in self.matchbet_data:
             if s != sport:
                 continue
             team = extract_team_from_bet(matchup, bet)
             if team:
                 teams.add(team)
         return sorted(teams, key=str.lower)
+
+    def _get_providers_for_sport(self, sport: str) -> List[str]:
+        """Return provider names for the given sport, sorted alphabetically."""
+        providers: set = set()
+        for s, _, _, _, _, _, _, provider in self.matchbet_data:
+            if s != sport:
+                continue
+            provider_name = str(provider or "").strip()
+            if provider_name:
+                providers.add(provider_name)
+        return sorted(providers, key=str.lower)
 
     def _populate_tournament_combo(self, sport: str):
         """Repopulate the tournament combo for the given sport."""
@@ -1193,18 +1228,30 @@ class MainWindow(QMainWindow):
         self.team_combo.setCurrentIndex(0)
         self.team_combo.blockSignals(False)
 
+    def _populate_provider_combo(self, sport: str):
+        """Repopulate the provider combo for the given sport."""
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.clear()
+        self.provider_combo.addItem("All Providers")
+        for provider in self._get_providers_for_sport(sport):
+            self.provider_combo.addItem(provider)
+        self.provider_combo.setCurrentIndex(0)
+        self.provider_combo.blockSignals(False)
+
     def _apply_filters(self):
         """Apply all active filters (tournament + team) and update the table and comparison."""
         sport = self.sport_combo.currentText()
         tournament = self.tournament_combo.currentText()
         team = self.team_combo.currentText()
+        provider = self.provider_combo.currentText()
         if not sport or sport not in self.data_cache:
             return
 
         all_tournaments = (tournament == "All Tournaments" or not tournament)
         all_teams = (team == "All Teams" or not team)
+        all_providers = (provider == "All Providers" or not provider)
 
-        if all_tournaments and all_teams:
+        if all_tournaments and all_teams and all_providers:
             # No filters — use full sport cache
             entry = self.data_cache[sport]
         else:
@@ -1222,6 +1269,10 @@ class MainWindow(QMainWindow):
                 if not all_teams:
                     bet_team = extract_team_from_bet(row[2], row[3])
                     if bet_team != team:
+                        continue
+                if not all_providers:
+                    row_provider = str(row[7] or "").strip()
+                    if row_provider != provider:
                         continue
                 filtered.append(row)
             if not filtered:
@@ -1257,129 +1308,771 @@ class MainWindow(QMainWindow):
         for btn in self._nav_buttons:
             btn.setChecked(btn is active)
 
-    def show_statistics_panel(self):
-        """Switch to statistics panel view"""
+    def show_statistics_panel(self, force_refresh_network: bool = False):
+        """Switch to statistics panel view."""
         self.current_view = "statistics"
         self._update_nav_buttons(self.btn_statistics)
         self.table.hide()
         self.add_bet_panel.hide()
         self.pending_bets_panel.hide()
         self.statistics_panel.show()
-        
-        # Clear existing layout
+
+        if getattr(self, "_statistics_panel_built", False):
+            self._update_statistics_panel_content(force_refresh_network=force_refresh_network)
+            return
+
+        filters = self._get_statistics_filter_state()
+
         layout = self.statistics_panel.layout()
         if layout is None:
             layout = QVBoxLayout(self.statistics_panel)
             self.statistics_panel.setLayout(layout)
-        
-        # Remove existing widgets in layout
+
+        self._clear_layout(layout)
+
+        records = self._load_statistics_records(force_refresh_network=force_refresh_network)
+        filtered_records, available_tournaments = self._filter_statistics_records(records, filters)
+        snapshot = self._build_statistics_snapshot(filtered_records)
+        self._statistics_snapshot = snapshot
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 12)
+        content_layout.setSpacing(14)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
+
+        title_block = QVBoxLayout()
+        title = QLabel("Statistics Dashboard")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+        subtitle = QLabel("Scan performance by sport, tournament, status, and market type.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size: 12px; color: #8b90a0;")
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        header_row.addLayout(title_block, 1)
+
+        self.btn_stats_refresh = QPushButton("Refresh Stats")
+        self.btn_stats_refresh.clicked.connect(lambda checked=False: self.show_statistics_panel(force_refresh_network=True))
+        header_row.addWidget(self.btn_stats_refresh, 0, Qt.AlignmentFlag.AlignRight)
+        content_layout.addLayout(header_row)
+
+        filter_group = QGroupBox("Filters")
+        filter_layout = QGridLayout(filter_group)
+        filter_layout.setHorizontalSpacing(10)
+        filter_layout.setVerticalSpacing(8)
+
+        self.stats_sport_filter = QComboBox()
+        self.stats_sport_filter.addItem("All Sports")
+        sport_options = sorted({self._normalize_stats_sport(str(record[1] or "")) for record in records if str(record[1] or "").strip()}, key=str.lower)
+        self.stats_sport_filter.addItems(sport_options)
+
+        self.stats_scope_filter = QComboBox()
+        self.stats_scope_filter.addItems(["All Bets", "Settled Bets", "Pending Bets"])
+
+        self.stats_market_filter = QComboBox()
+        self.stats_market_filter.addItems(["All Markets", "LIVE Only", "NOT LIVE Only"])
+
+        self.stats_tournament_filter = QComboBox()
+        self.stats_tournament_filter.addItem("All Tournaments")
+        self.stats_tournament_filter.addItems(available_tournaments)
+
+        self.stats_from_date_filter = QDateEdit()
+        self.stats_from_date_filter.setCalendarPopup(True)
+        self.stats_from_date_filter.setDisplayFormat("yyyy-MM-dd")
+        self.stats_from_date_filter.setMinimumDate(QDate(2000, 1, 1))
+        self.stats_from_date_filter.setMaximumDate(QDate.currentDate())
+        if filters["from_date"]:
+            from_date = QDate.fromString(filters["from_date"], "yyyy-MM-dd")
+            if from_date.isValid():
+                self.stats_from_date_filter.setDate(from_date)
+        else:
+            self.stats_from_date_filter.setDate(self._get_statistics_default_from_date(records))
+
+        self.stats_search_filter = QLineEdit()
+        self.stats_search_filter.setPlaceholderText("Search sport, tournament, matchup, bet, or result")
+
+        self.btn_stats_reset = QPushButton("Reset")
+        self.btn_stats_reset.clicked.connect(self._reset_statistics_filters)
+
+        sport_filter_index = self.stats_sport_filter.findText(filters["sport"])
+        if sport_filter_index >= 0:
+            self.stats_sport_filter.setCurrentIndex(sport_filter_index)
+
+        scope_filter_index = self.stats_scope_filter.findText(filters["scope"])
+        if scope_filter_index >= 0:
+            self.stats_scope_filter.setCurrentIndex(scope_filter_index)
+
+        market_filter_index = self.stats_market_filter.findText(filters["market"])
+        if market_filter_index >= 0:
+            self.stats_market_filter.setCurrentIndex(market_filter_index)
+
+        tournament_filter_index = self.stats_tournament_filter.findText(filters["tournament"])
+        if tournament_filter_index >= 0:
+            self.stats_tournament_filter.setCurrentIndex(tournament_filter_index)
+
+        self.stats_search_filter.setText(filters["search"])
+
+        self.stats_sport_filter.currentTextChanged.connect(self._schedule_statistics_refresh)
+        self.stats_scope_filter.currentTextChanged.connect(self._schedule_statistics_refresh)
+        self.stats_market_filter.currentTextChanged.connect(self._schedule_statistics_refresh)
+        self.stats_tournament_filter.currentTextChanged.connect(self._schedule_statistics_refresh)
+        self.stats_from_date_filter.dateChanged.connect(self._schedule_statistics_refresh)
+        self.stats_search_filter.textChanged.connect(self._schedule_statistics_refresh)
+
+        filter_layout.addWidget(QLabel("Sport"), 0, 0)
+        filter_layout.addWidget(self.stats_sport_filter, 0, 1)
+        filter_layout.addWidget(QLabel("Scope"), 0, 2)
+        filter_layout.addWidget(self.stats_scope_filter, 0, 3)
+        filter_layout.addWidget(QLabel("Market"), 0, 4)
+        filter_layout.addWidget(self.stats_market_filter, 0, 5)
+        filter_layout.addWidget(QLabel("Tournament"), 1, 0)
+        filter_layout.addWidget(self.stats_tournament_filter, 1, 1)
+        filter_layout.addWidget(QLabel("From date"), 1, 2)
+        filter_layout.addWidget(self.stats_from_date_filter, 1, 3)
+        filter_layout.addWidget(self.stats_search_filter, 1, 4, 1, 2)
+        filter_layout.addWidget(self.btn_stats_reset, 0, 6, 2, 1)
+        for column in (1, 3, 5):
+            filter_layout.setColumnStretch(column, 1)
+        filter_layout.setColumnStretch(4, 2)
+        content_layout.addWidget(filter_group)
+
+        overall = snapshot["overall"]
+        card_grid = QGridLayout()
+        card_grid.setHorizontalSpacing(10)
+        card_grid.setVerticalSpacing(10)
+        cards = [
+            self._make_stat_card("Total Bets", str(overall["total_bets"]), "All records in the current filter set", "neutral"),
+            self._make_stat_card("Settled / Pending", f'{overall["settled_bets"]} / {overall["pending_bets"]}', "Closed versus open bets", "neutral"),
+            self._make_stat_card("Win Rate", self._format_percent(overall["win_rate"]), f'{overall["wins"]} wins, {overall["losses"]} losses', "positive"),
+            self._make_stat_card("Profit", self._format_money(overall["profit"]), "Sum of settled profits", "positive" if overall["profit"] >= 0 else "negative"),
+            self._make_stat_card("Average Odds", self._format_decimal(overall["avg_odds"]), "Mean odds across filtered bets", "neutral"),
+            self._make_stat_card("LIVE / NOT LIVE", f'{overall["live_bets"]} / {overall["not_live_bets"]}', "Market split for the current view", "neutral"),
+        ]
+        for index, card in enumerate(cards):
+            card_grid.addWidget(card, index // 3, index % 3)
+        for column in range(3):
+            card_grid.setColumnStretch(column, 1)
+        content_layout.addLayout(card_grid)
+
+        body_layout = QVBoxLayout()
+        body_layout.setSpacing(12)
+
+        left_group = QGroupBox("Sports and Tournaments")
+        left_layout = QVBoxLayout(left_group)
+        self.stats_tree = QTreeWidget()
+        self.stats_tree.setAlternatingRowColors(True)
+        self.stats_tree.setHeaderLabels(["Category", "Bets", "Settled", "Win Rate", "Profit"])
+        tree_header = self.stats_tree.header()
+        tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3, 4):
+            tree_header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        self.stats_tree.setColumnWidth(1, 80)
+        self.stats_tree.setColumnWidth(2, 80)
+        self.stats_tree.setColumnWidth(3, 90)
+        self.stats_tree.setColumnWidth(4, 95)
+        self.stats_tree.setRootIsDecorated(True)
+        self.stats_tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.stats_tree.itemSelectionChanged.connect(self._update_statistics_detail)
+
+        sports = sorted(snapshot["sports"].items(), key=lambda item: item[1]["total"], reverse=True)
+        for sport, sport_data in sports:
+            sport_item = QTreeWidgetItem(self.stats_tree)
+            sport_item.setText(0, sport)
+            sport_item.setText(1, str(sport_data["total"]))
+            sport_item.setText(2, str(sport_data["settled"]))
+            sport_item.setText(3, self._format_percent(sport_data["win_rate"]))
+            sport_item.setText(4, self._format_money(sport_data["profit"]))
+            sport_item.setData(0, Qt.ItemDataRole.UserRole, ("sport", sport, ""))
+            sport_item.setExpanded(True)
+            for tournament, tournament_data in sorted(sport_data["tournaments"].items(), key=lambda item: item[1]["total"], reverse=True):
+                tournament_item = QTreeWidgetItem(sport_item)
+                tournament_item.setText(0, tournament)
+                tournament_item.setText(1, str(tournament_data["total"]))
+                tournament_item.setText(2, str(tournament_data["settled"]))
+                tournament_item.setText(3, self._format_percent(tournament_data["win_rate"]))
+                tournament_item.setText(4, self._format_money(tournament_data["profit"]))
+                tournament_item.setData(0, Qt.ItemDataRole.UserRole, ("tournament", sport, tournament))
+
+        if self.stats_tree.topLevelItemCount() > 0:
+            self.stats_tree.setCurrentItem(self.stats_tree.topLevelItem(0))
+
+        left_layout.addWidget(self.stats_tree)
+        body_layout.addWidget(left_group)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        detail_group = QGroupBox("Selection Details")
+        detail_layout = QVBoxLayout(detail_group)
+        self.stats_detail_label = QLabel()
+        self.stats_detail_label.setWordWrap(True)
+        self.stats_detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail_layout.addWidget(self.stats_detail_label)
+        right_layout.addWidget(detail_group)
+
+        insight_group = QGroupBox("Quick Insights")
+        insight_layout = QVBoxLayout(insight_group)
+        self.stats_insight_label = QLabel(self._build_statistics_insights(snapshot))
+        self.stats_insight_label.setWordWrap(True)
+        self.stats_insight_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        insight_layout.addWidget(self.stats_insight_label)
+        right_layout.addWidget(insight_group)
+
+        roadmap_group = QGroupBox("Ideas to Add Next")
+        roadmap_layout = QVBoxLayout(roadmap_group)
+        self.stats_roadmap_label = QLabel(
+            "<ul>"
+            "<li>Win-rate and profit trend charts over time.</li>"
+            "<li>Streak tracking for current hot and cold runs.</li>"
+            "<li>A search box that filters down to a single bet or matchup.</li>"
+            "<li>Top and bottom performer chips for quick navigation.</li>"
+            "<li>Export buttons for CSV or image snapshots of the dashboard.</li>"
+            "</ul>"
+        )
+        self.stats_roadmap_label.setWordWrap(True)
+        roadmap_layout.addWidget(self.stats_roadmap_label)
+        right_layout.addWidget(roadmap_group)
+
+        body_layout.addWidget(right_widget)
+        content_layout.addLayout(body_layout, 1)
+
+        self._statistics_panel_built = True
+        self._update_statistics_detail()
+
+    def _clear_layout(self, layout):
         while layout.count():
             item = layout.takeAt(0)
             widget = item.widget()
-            if widget:
+            if widget is not None:
                 widget.deleteLater()
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
 
-        # --- Container 1: Tournament Statistics ---
-        tournament_group = QGroupBox("Tournament Statistics")
-        t_layout = QVBoxLayout(tournament_group)
+    def _normalize_stats_sport(self, sport: str) -> str:
+        sport_name = str(sport or "").strip()
+        if not sport_name:
+            return "Unknown"
+        if sport_name == "CStwo":
+            return "CS2"
+        return sport_name
 
-        # Group by Sport -> Tournament
-        # matchbet_data is list of (sport, tournament, matchup, bet, live_status, odds, result)
-        # stats structure: stats[sport][tournament] = {'wins': 0, 'total': 0}
-        stats = {}
-        for sport, tournament, _, _, _, _, result in self.matchbet_data:
-            if not sport: continue
-            
-            # Normalize sport names
-            if sport == "CStwo":
-                sport = "CS2"
+    def _get_statistics_filter_state(self) -> Dict[str, str]:
+        return {
+            "sport": self.stats_sport_filter.currentText() if hasattr(self, "stats_sport_filter") else "All Sports",
+            "tournament": self.stats_tournament_filter.currentText() if hasattr(self, "stats_tournament_filter") else "All Tournaments",
+            "scope": self.stats_scope_filter.currentText() if hasattr(self, "stats_scope_filter") else "All Bets",
+            "market": self.stats_market_filter.currentText() if hasattr(self, "stats_market_filter") else "All Markets",
+            "from_date": self.stats_from_date_filter.date().toString("yyyy-MM-dd") if hasattr(self, "stats_from_date_filter") else "",
+            "search": self.stats_search_filter.text().strip() if hasattr(self, "stats_search_filter") else "",
+        }
 
-            if not tournament: continue
-            
-            norm_tourney = normalize_tournament_name(tournament)
-            if not norm_tourney: continue
-            
-            if sport not in stats:
-                stats[sport] = {}
-            if norm_tourney not in stats[sport]:
-                stats[sport][norm_tourney] = {'wins': 0, 'total': 0}
-            
-            stats[sport][norm_tourney]['total'] += 1
-            if result.lower() == "win":
-                stats[sport][norm_tourney]['wins'] += 1
-        
-        # Create Tree Widget
-        tree = QTreeWidget()
-        tree.setMinimumWidth(400)
-        tree.setHeaderLabels(["Sport / Tournament", "Bet Count", "Winrate %"])
-        tree.setAlternatingRowColors(True)
-        
-        # Configure columns: Stretch first, Fixed width for others
-        header = tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionsMovable(False)
-        
-        tree.setColumnWidth(1, 100)
-        tree.setColumnWidth(2, 100)
-        
-        # Center align headers for numeric columns
-        tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-        tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
-        
-        # Populate Tree
-        # Sort sports by total bets descending
-        sport_totals = {}
-        for s, tourneys in stats.items():
-            s_wins = sum(t['wins'] for t in tourneys.values())
-            s_total = sum(t['total'] for t in tourneys.values())
-            sport_totals[s] = {'wins': s_wins, 'total': s_total}
+    def _get_statistics_default_from_date(self, records: List[Tuple]) -> QDate:
+        dates = []
+        for record in records:
+            if len(record) < 12:
+                continue
+            parsed = self._parse_statistics_datetime(record[10])
+            if parsed is not None:
+                dates.append(parsed.date())
+        if dates:
+            oldest = min(dates)
+            return QDate(oldest.year, oldest.month, oldest.day)
+        return QDate.currentDate()
 
-        sorted_sports = sorted(stats.keys(), key=lambda s: sport_totals[s]['total'], reverse=True)
+    def _parse_statistics_datetime(self, value) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            text = str(value).replace("Z", "+00:00")
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
 
-        for sport in sorted_sports:
-            s_data = sport_totals[sport]
-            total_sport_bets = s_data['total']
-            total_sport_wins = s_data['wins']
-            sport_wr = (total_sport_wins / total_sport_bets * 100) if total_sport_bets > 0 else 0.0
-            
-            sport_item = QTreeWidgetItem(tree)
+    def _load_statistics_records(self, force_refresh_network: bool = False) -> List[Tuple]:
+        try:
+            return self.db.fetch_all_bets(force_refresh=force_refresh_network)
+        except Exception as e:
+            print(f"Error fetching statistics data: {e}")
+            return []
+
+    def _update_statistics_panel_content(self, force_refresh_network: bool = False):
+        if not hasattr(self, "stats_tree"):
+            self.show_statistics_panel(force_refresh_network=force_refresh_network)
+            return
+
+        records = self._load_statistics_records(force_refresh_network=force_refresh_network)
+        filters = self._get_statistics_filter_state()
+        filtered_records, available_tournaments = self._filter_statistics_records(records, filters)
+        snapshot = self._build_statistics_snapshot(filtered_records)
+        self._statistics_snapshot = snapshot
+
+        self.stats_tournament_filter.blockSignals(True)
+        current_tournament = self.stats_tournament_filter.currentText()
+        self.stats_tournament_filter.clear()
+        self.stats_tournament_filter.addItem("All Tournaments")
+        self.stats_tournament_filter.addItems(available_tournaments)
+        if current_tournament and self.stats_tournament_filter.findText(current_tournament) >= 0:
+            self.stats_tournament_filter.setCurrentText(current_tournament)
+        else:
+            self.stats_tournament_filter.setCurrentIndex(0)
+        self.stats_tournament_filter.blockSignals(False)
+
+        self._populate_statistics_tree(snapshot)
+
+        overall = snapshot["overall"]
+        if hasattr(self, "stats_detail_label"):
+            self.stats_detail_label.setText("Select a sport or tournament to inspect the filtered data.")
+        if hasattr(self, "stats_insight_label"):
+            self.stats_insight_label.setText(self._build_statistics_insights(snapshot))
+
+        self.stats_tree.setEnabled(True)
+        if self.stats_tree.topLevelItemCount() > 0:
+            self.stats_tree.setCurrentItem(self.stats_tree.topLevelItem(0))
+        self._update_statistics_detail()
+
+    def _populate_statistics_tree(self, snapshot: Dict[str, dict]):
+        self.stats_tree.blockSignals(True)
+        self.stats_tree.clear()
+
+        sports = sorted(snapshot["sports"].items(), key=lambda item: item[1]["total"], reverse=True)
+        for sport, sport_data in sports:
+            sport_item = QTreeWidgetItem(self.stats_tree)
             sport_item.setText(0, sport)
-            sport_item.setText(1, str(total_sport_bets))
-            sport_item.setText(2, f"{sport_wr:.1f}%")
-            sport_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-            sport_item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
-            sport_item.setExpanded(False)
-            
-            # Sort tournaments by count descending
-            tourneys = stats[sport]
-            sorted_tourneys = sorted(tourneys.items(), key=lambda item: item[1]['total'], reverse=True)
+            sport_item.setText(1, str(sport_data["total"]))
+            sport_item.setText(2, str(sport_data["settled"]))
+            sport_item.setText(3, self._format_percent(sport_data["win_rate"]))
+            sport_item.setText(4, self._format_money(sport_data["profit"]))
+            sport_item.setData(0, Qt.ItemDataRole.UserRole, ("sport", sport, ""))
+            sport_item.setExpanded(True)
+            for tournament, tournament_data in sorted(sport_data["tournaments"].items(), key=lambda item: item[1]["total"], reverse=True):
+                tournament_item = QTreeWidgetItem(sport_item)
+                tournament_item.setText(0, tournament)
+                tournament_item.setText(1, str(tournament_data["total"]))
+                tournament_item.setText(2, str(tournament_data["settled"]))
+                tournament_item.setText(3, self._format_percent(tournament_data["win_rate"]))
+                tournament_item.setText(4, self._format_money(tournament_data["profit"]))
+                tournament_item.setData(0, Qt.ItemDataRole.UserRole, ("tournament", sport, tournament))
 
-            for tourney, t_data in sorted_tourneys:
-                t_total = t_data['total']
-                t_wins = t_data['wins']
-                t_wr = (t_wins / t_total * 100) if t_total > 0 else 0.0
+        if self.stats_tree.topLevelItemCount() > 0:
+            self.stats_tree.setCurrentItem(self.stats_tree.topLevelItem(0))
+        self.stats_tree.blockSignals(False)
 
-                t_item = QTreeWidgetItem(sport_item)
-                t_item.setText(0, tourney)
-                t_item.setText(1, str(t_total))
-                t_item.setText(2, f"{t_wr:.1f}%")
-                t_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-                t_item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
+    def _filter_statistics_records(self, records: List[Tuple], filters: Dict[str, str]) -> Tuple[List[dict], List[str]]:
+        base_records: List[dict] = []
+        tournaments = set()
 
-        total_visible_bets = sum(d['total'] for d in sport_totals.values())
-        t_layout.addWidget(QLabel(f"Total Bets: {total_visible_bets}"))
-        t_layout.addWidget(tree)
+        for record in records:
+            if len(record) < 12:
+                continue
 
-        # --- Container 2: Empty ---
-        second_group = QGroupBox("Additional Statistics")
-        QVBoxLayout(second_group)
+            _, sport, tournament, matchup, bet, live_status, odds, bet_amount, result, profit, date_created, _provider = record
+            sport_name = self._normalize_stats_sport(sport)
+            tournament_name = normalize_tournament_name(str(tournament or "")) or "Unspecified"
+            result_text = str(result or "").strip()
+            live_status_text = str(live_status or "").strip()
+            is_live = "LIVE" in live_status_text.upper() and "NOT" not in live_status_text.upper()
+            is_settled = bool(result_text)
+            parsed_date = self._parse_statistics_datetime(date_created)
 
-        # Add containers to main layout
-        layout.addWidget(tournament_group, 4)
-        layout.addWidget(second_group, 2)
-        layout.addStretch(1)
+            if filters["sport"] != "All Sports" and sport_name != filters["sport"]:
+                continue
+            if filters["scope"] == "Settled Bets" and not is_settled:
+                continue
+            if filters["scope"] == "Pending Bets" and is_settled:
+                continue
+            if filters["market"] == "LIVE Only" and not is_live:
+                continue
+            if filters["market"] == "NOT LIVE Only" and is_live:
+                continue
+            if filters.get("from_date"):
+                from_date = QDate.fromString(filters["from_date"], "yyyy-MM-dd")
+                if from_date.isValid() and parsed_date is not None:
+                    record_date = QDate(parsed_date.year, parsed_date.month, parsed_date.day)
+                    if record_date < from_date:
+                        continue
+                elif from_date.isValid() and parsed_date is None:
+                    continue
+
+            parsed = {
+                "id": record[0],
+                "sport": sport_name,
+                "tournament": tournament_name,
+                "matchup": str(matchup or ""),
+                "bet": str(bet or ""),
+                "live_status": live_status_text,
+                "odds": float(odds or 0.0),
+                "bet_amount": float(bet_amount or 0.0),
+                "result": result_text,
+                "profit": float(profit or 0.0),
+                "date_created": str(date_created or ""),
+                "parsed_date": parsed_date,
+                "is_live": is_live,
+                "is_settled": is_settled,
+                "is_win": result_text.lower() == "win",
+                "is_loss": result_text.lower() == "lose",
+            }
+
+            base_records.append(parsed)
+            tournaments.add(tournament_name)
+
+        final_records: List[dict] = []
+        search_text = filters["search"].lower()
+        for parsed in base_records:
+            if filters["tournament"] != "All Tournaments" and parsed["tournament"] != filters["tournament"]:
+                continue
+            if search_text:
+                haystack = " ".join([
+                    parsed["sport"], parsed["tournament"], parsed["matchup"],
+                    parsed["bet"], parsed["live_status"], parsed["result"]
+                ]).lower()
+                if search_text not in haystack:
+                    continue
+            final_records.append(parsed)
+
+        return final_records, sorted(tournaments, key=str.lower)
+
+    def _build_statistics_snapshot(self, records: List[dict]) -> Dict[str, dict]:
+        snapshot: Dict[str, dict] = {
+            "records": records,
+            "sports": {},
+            "overall": {
+                "total_bets": 0,
+                "settled_bets": 0,
+                "pending_bets": 0,
+                "wins": 0,
+                "losses": 0,
+                "profit": 0.0,
+                "odds_sum": 0.0,
+                "live_bets": 0,
+                "not_live_bets": 0,
+                "live_settled": 0,
+                "live_wins": 0,
+                "not_live_settled": 0,
+                "not_live_wins": 0,
+            },
+        }
+
+        for record in records:
+            overall = snapshot["overall"]
+            sport = record["sport"]
+            tournament = record["tournament"]
+            sport_bucket = snapshot["sports"].setdefault(
+                sport,
+                {
+                    "total": 0,
+                    "settled": 0,
+                    "pending": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "profit": 0.0,
+                    "odds_sum": 0.0,
+                    "live_total": 0,
+                    "live_settled": 0,
+                    "live_wins": 0,
+                    "not_live_total": 0,
+                    "not_live_settled": 0,
+                    "not_live_wins": 0,
+                    "tournaments": {},
+                },
+            )
+
+            tournament_bucket = sport_bucket["tournaments"].setdefault(
+                tournament,
+                {
+                    "total": 0,
+                    "settled": 0,
+                    "pending": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "profit": 0.0,
+                    "odds_sum": 0.0,
+                    "live_total": 0,
+                    "live_settled": 0,
+                    "live_wins": 0,
+                    "not_live_total": 0,
+                    "not_live_settled": 0,
+                    "not_live_wins": 0,
+                },
+            )
+
+            for bucket in (sport_bucket, tournament_bucket):
+                bucket["total"] += 1
+                bucket["profit"] += record["profit"]
+                bucket["odds_sum"] += record["odds"]
+                if record["is_settled"]:
+                    bucket["settled"] += 1
+                    if record["is_win"]:
+                        bucket["wins"] += 1
+                    elif record["is_loss"]:
+                        bucket["losses"] += 1
+                else:
+                    bucket["pending"] += 1
+                if record["is_live"]:
+                    bucket["live_total"] += 1
+                    if record["is_settled"]:
+                        bucket["live_settled"] += 1
+                        if record["is_win"]:
+                            bucket["live_wins"] += 1
+                else:
+                    bucket["not_live_total"] += 1
+                    if record["is_settled"]:
+                        bucket["not_live_settled"] += 1
+                        if record["is_win"]:
+                            bucket["not_live_wins"] += 1
+
+            overall["total_bets"] += 1
+            overall["profit"] += record["profit"]
+            overall["odds_sum"] += record["odds"]
+            if record["is_live"]:
+                overall["live_bets"] += 1
+            else:
+                overall["not_live_bets"] += 1
+
+            if record["is_settled"]:
+                overall["settled_bets"] += 1
+                if record["is_win"]:
+                    overall["wins"] += 1
+                elif record["is_loss"]:
+                    overall["losses"] += 1
+                if record["is_live"]:
+                    overall["live_settled"] += 1
+                    if record["is_win"]:
+                        overall["live_wins"] += 1
+                else:
+                    overall["not_live_settled"] += 1
+                    if record["is_win"]:
+                        overall["not_live_wins"] += 1
+            else:
+                overall["pending_bets"] += 1
+
+        overall["avg_odds"] = overall["odds_sum"] / overall["total_bets"] if overall["total_bets"] > 0 else None
+        overall["win_rate"] = overall["wins"] / overall["settled_bets"] if overall["settled_bets"] > 0 else None
+        overall["live_win_rate"] = overall["live_wins"] / overall["live_settled"] if overall["live_settled"] > 0 else None
+        overall["not_live_win_rate"] = overall["not_live_wins"] / overall["not_live_settled"] if overall["not_live_settled"] > 0 else None
+
+        for sport_data in snapshot["sports"].values():
+            sport_data["win_rate"] = sport_data["wins"] / sport_data["settled"] if sport_data["settled"] > 0 else None
+            sport_data["avg_odds"] = sport_data["odds_sum"] / sport_data["total"] if sport_data["total"] > 0 else None
+            for tournament_data in sport_data["tournaments"].values():
+                tournament_data["win_rate"] = tournament_data["wins"] / tournament_data["settled"] if tournament_data["settled"] > 0 else None
+                tournament_data["avg_odds"] = tournament_data["odds_sum"] / tournament_data["total"] if tournament_data["total"] > 0 else None
+
+        snapshot["top_sports_by_volume"] = sorted(snapshot["sports"].items(), key=lambda item: item[1]["total"], reverse=True)
+        snapshot["top_sports_by_profit"] = sorted(snapshot["sports"].items(), key=lambda item: item[1]["profit"], reverse=True)
+        snapshot["top_tournaments_by_volume"] = self._flatten_tournaments(snapshot, sort_key="total")
+        snapshot["top_tournaments_by_profit"] = self._flatten_tournaments(snapshot, sort_key="profit")
+        snapshot["top_tournaments_by_win_rate"] = [
+            item for item in self._flatten_tournaments(snapshot, sort_key="win_rate", reverse=True)
+            if item[2]["settled"] > 0
+        ]
+        return snapshot
+
+    def _flatten_tournaments(self, snapshot: Dict[str, dict], sort_key: str = "total", reverse: bool = True):
+        items = []
+        for sport, sport_data in snapshot["sports"].items():
+            for tournament, tournament_data in sport_data["tournaments"].items():
+                items.append((sport, tournament, tournament_data))
+        return sorted(items, key=lambda item: item[2][sort_key] if item[2][sort_key] is not None else float("-inf"), reverse=reverse)
+
+    def _format_percent(self, value: Optional[float]) -> str:
+        return "N/A" if value is None else f"{value * 100:.1f}%"
+
+    def _format_decimal(self, value: Optional[float]) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
+
+    def _format_money(self, value: float) -> str:
+        sign = "+" if value >= 0 else ""
+        return f"{sign}{value:.2f}"
+
+    def _make_stat_card(self, title: str, value: str, subtitle: str, tone: str = "neutral") -> QWidget:
+        app = QApplication.instance()
+        positive_color = app.property("positiveColor") if app else None
+        negative_color = app.property("negativeColor") if app else None
+        neutral_color = app.property("neutralColor") if app else None
+        if not isinstance(positive_color, QColor):
+            positive_color = QColor("#16a34a")
+        if not isinstance(negative_color, QColor):
+            negative_color = QColor("#dc2626")
+        if not isinstance(neutral_color, QColor):
+            neutral_color = QColor("#6b7280")
+
+        tone_color = neutral_color
+        if tone == "positive":
+            tone_color = positive_color
+        elif tone == "negative":
+            tone_color = negative_color
+
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame {"
+            " background-color: rgba(255, 255, 255, 0.03);"
+            f" border: 1px solid {tone_color.name()};"
+            " border-radius: 14px;"
+            " }"
+        )
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"font-size: 11px; font-weight: 700; color: {tone_color.name()};")
+        value_label = QLabel(value)
+        value_label.setStyleSheet("font-size: 20px; font-weight: 800;")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setStyleSheet("font-size: 11px; color: #8b90a0;")
+
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+        card_layout.addWidget(subtitle_label)
+        return card
+
+    def _build_statistics_insights(self, snapshot: Dict[str, dict]) -> str:
+        overall = snapshot["overall"]
+        lines = ["<b>Current snapshot</b><br>"]
+        lines.append(f'Total records: {overall["total_bets"]}<br>')
+        lines.append(f'Settled bets: {overall["settled_bets"]}<br>')
+        lines.append(f'Pending bets: {overall["pending_bets"]}<br>')
+        lines.append(f'Win rate: {self._format_percent(overall["win_rate"])}<br>')
+        lines.append(f'Profit: {self._format_money(overall["profit"])}<br><br>')
+
+        top_sport = snapshot["top_sports_by_volume"][0] if snapshot["top_sports_by_volume"] else None
+        if top_sport is not None:
+            lines.append(f'<b>Most active sport:</b> {top_sport[0]} ({top_sport[1]["total"]} bets)<br>')
+
+        best_profit_tourney = snapshot["top_tournaments_by_profit"][0] if snapshot["top_tournaments_by_profit"] else None
+        if best_profit_tourney is not None:
+            lines.append(
+                f'<b>Best tournament by profit:</b> {best_profit_tourney[1]} / {best_profit_tourney[0]} '
+                f'({self._format_money(best_profit_tourney[2]["profit"])})<br>'
+            )
+
+        best_wr_tourney = next((item for item in snapshot["top_tournaments_by_win_rate"] if item[2]["settled"] >= 3), None)
+        if best_wr_tourney is not None:
+            lines.append(
+                f'<b>Best tournament by win rate:</b> {best_wr_tourney[1]} / {best_wr_tourney[0]} '
+                f'({self._format_percent(best_wr_tourney[2]["win_rate"])})<br>'
+            )
+
+        live_wr = snapshot["overall"].get("live_win_rate")
+        not_live_wr = snapshot["overall"].get("not_live_win_rate")
+        lines.append(f'<br><b>LIVE win rate:</b> {self._format_percent(live_wr)}<br>')
+        lines.append(f'<b>NOT LIVE win rate:</b> {self._format_percent(not_live_wr)}<br>')
+        return "".join(lines)
+
+    def _update_statistics_detail(self):
+        tree = getattr(self, "stats_tree", None)
+        detail_label = getattr(self, "stats_detail_label", None)
+        if tree is None or detail_label is None:
+            return
+
+        current = tree.currentItem()
+        snapshot = getattr(self, "_statistics_snapshot", {})
+        if not current or not snapshot:
+            detail_label.setText("Select a sport or tournament to inspect the filtered data.")
+            return
+
+        payload = current.data(0, Qt.ItemDataRole.UserRole)
+        if not payload:
+            detail_label.setText("Select a sport or tournament to inspect the filtered data.")
+            return
+
+        kind, sport, tournament = payload
+        if kind == "sport":
+            bucket = snapshot["sports"].get(sport)
+            if bucket is None:
+                return
+            title = f"<b>{sport}</b>"
+            subtitle = f'{bucket["total"]} bets, {bucket["settled"]} settled, {bucket["pending"]} pending'
+            top_tournaments = sorted(bucket["tournaments"].items(), key=lambda item: item[1]["total"], reverse=True)[:3]
+            extra_lines = "".join(
+                f'<li>{name}: {data["total"]} bets, {self._format_percent(data["win_rate"])} win rate, {self._format_money(data["profit"])} profit</li>'
+                for name, data in top_tournaments
+            )
+            detail_header = "Top related tournaments"
+        else:
+            bucket = snapshot["sports"].get(sport, {}).get("tournaments", {}).get(tournament)
+            if bucket is None:
+                return
+            title = f"<b>{tournament}</b><br><span style='font-size: 12px;'>in {sport}</span>"
+            subtitle = f'{bucket["total"]} bets, {bucket["settled"]} settled, {bucket["pending"]} pending'
+            extra_lines = "".join([
+                f'<li>LIVE split: {bucket["live_total"]} total, {bucket["live_settled"]} settled, '
+                f'{self._format_percent(bucket["live_wins"] / bucket["live_settled"] if bucket["live_settled"] else None)} win rate</li>',
+                f'<li>NOT LIVE split: {bucket["not_live_total"]} total, {bucket["not_live_settled"]} settled, '
+                f'{self._format_percent(bucket["not_live_wins"] / bucket["not_live_settled"] if bucket["not_live_settled"] else None)} win rate</li>'
+            ])
+            detail_header = "Market split"
+
+        detail_html = [
+            title,
+            f'<br><b>Summary:</b> {subtitle}<br>',
+            f'<b>Win rate:</b> {self._format_percent(bucket["win_rate"])}<br>',
+            f'<b>Profit:</b> {self._format_money(bucket["profit"])}<br>',
+            f'<b>Average odds:</b> {self._format_decimal(bucket["avg_odds"])}<br>',
+            f'<b>LIVE / NOT LIVE:</b> {bucket["live_total"]} / {bucket["not_live_total"]}<br><br>',
+            f'<b>{detail_header}:</b><ul>',
+            extra_lines,
+            '</ul>'
+        ]
+        detail_label.setText("".join(detail_html))
+
+    def _refresh_statistics_panel(self, *args):
+        self._schedule_statistics_refresh(*args)
+
+    def _schedule_statistics_refresh(self, *args):
+        if self.current_view != "statistics":
+            return
+        if self._statistics_refresh_pending:
+            return
+        self._statistics_refresh_pending = True
+
+        def _run_refresh():
+            self._statistics_refresh_pending = False
+            if self.current_view != "statistics":
+                return
+            if getattr(self, "_statistics_panel_built", False):
+                self._update_statistics_panel_content()
+            else:
+                self.show_statistics_panel()
+
+        QTimer.singleShot(0, _run_refresh)
+
+    def _reset_statistics_filters(self):
+        for widget, value in (
+            (getattr(self, "stats_sport_filter", None), "All Sports"),
+            (getattr(self, "stats_scope_filter", None), "All Bets"),
+            (getattr(self, "stats_market_filter", None), "All Markets"),
+            (getattr(self, "stats_tournament_filter", None), "All Tournaments"),
+        ):
+            if widget is not None:
+                widget.blockSignals(True)
+                widget.setCurrentText(value)
+                widget.blockSignals(False)
+        if hasattr(self, "stats_from_date_filter"):
+            self.stats_from_date_filter.blockSignals(True)
+            self.stats_from_date_filter.setDate(self._get_statistics_default_from_date(self._load_statistics_records()))
+            self.stats_from_date_filter.blockSignals(False)
+        if hasattr(self, "stats_search_filter"):
+            self.stats_search_filter.blockSignals(True)
+            self.stats_search_filter.clear()
+            self.stats_search_filter.blockSignals(False)
+        if getattr(self, "_statistics_panel_built", False):
+            self._update_statistics_panel_content()
+        else:
+            self.show_statistics_panel()
 
     def show_data_table_panel(self):
         """Switch to data table view"""
@@ -1419,6 +2112,11 @@ class MainWindow(QMainWindow):
         self.form_tournament = QComboBox()
         self.form_tournament.setEditable(True)
         form.addRow("Tournament:", self.form_tournament)
+
+        # Provider
+        self.form_provider = QComboBox()
+        self.form_provider.setEditable(True)
+        form.addRow("Provider:", self.form_provider)
 
         # Matchup
         matchup_layout = QHBoxLayout()
@@ -1510,31 +2208,39 @@ class MainWindow(QMainWindow):
     def _on_form_sport_changed(self, sport: str):
         """Update tournament and team combo boxes when the sport changes."""
         self.form_tournament.blockSignals(True)
+        self.form_provider.blockSignals(True)
         self.form_matchup_team_a.blockSignals(True)
         self.form_matchup_team_b.blockSignals(True)
 
         current_tournament = self.form_tournament.currentText()
+        current_provider = self.form_provider.currentText()
         current_team_a = self.form_matchup_team_a.currentText()
         current_team_b = self.form_matchup_team_b.currentText()
 
         self.form_tournament.clear()
+        self.form_provider.clear()
         self.form_matchup_team_a.clear()
         self.form_matchup_team_b.clear()
 
         if sport:
             tournaments = self._get_tournaments_for_sport(sport)
+            providers = self._get_providers_for_sport(sport)
             teams = self._get_teams_for_sport(sport)
             if tournaments:
                 self.form_tournament.addItems(tournaments)
+            if providers:
+                self.form_provider.addItems(providers)
             if teams:
                 self.form_matchup_team_a.addItems(teams)
                 self.form_matchup_team_b.addItems(teams)
 
         self.form_tournament.setCurrentText(current_tournament)
+        self.form_provider.setCurrentText(current_provider)
         self.form_matchup_team_a.setCurrentText(current_team_a)
         self.form_matchup_team_b.setCurrentText(current_team_b)
 
         self.form_tournament.blockSignals(False)
+        self.form_provider.blockSignals(False)
         self.form_matchup_team_a.blockSignals(False)
         self.form_matchup_team_b.blockSignals(False)
 
@@ -1576,6 +2282,21 @@ class MainWindow(QMainWindow):
             self.form_sport.setCurrentText(current)
         self.form_sport.blockSignals(False)
 
+    def _populate_form_providers(self):
+        """Populate the provider combo in the add-bet form from existing data."""
+        self.form_provider.blockSignals(True)
+        current = self.form_provider.currentText()
+        self.form_provider.clear()
+        try:
+            providers = self.db.get_distinct_providers()
+        except Exception:
+            providers = []
+        for provider in providers:
+            self.form_provider.addItem(provider)
+        if current:
+            self.form_provider.setCurrentText(current)
+        self.form_provider.blockSignals(False)
+
     def show_add_bet_panel(self):
         """Switch to add-bet form in add mode."""
         self.current_view = "add_bet"
@@ -1592,10 +2313,11 @@ class MainWindow(QMainWindow):
         self.add_bet_title.setText("Add New Bet")
         self.btn_save_bet.setText("Save Bet")
         self._populate_form_sports()
+        self._populate_form_providers()
 
         # Enable all fields
         for w in [self.form_sport, self.form_tournament, 
-                  self.form_matchup_team_a, self.form_matchup_team_b,
+                  self.form_provider, self.form_matchup_team_a, self.form_matchup_team_b,
                   self.form_bet, self.form_live_status,
                   self.form_odds, self.form_bet_amount]:
             w.setEnabled(True)
@@ -1609,6 +2331,7 @@ class MainWindow(QMainWindow):
         if self.editing_bet_id is None:
             self.form_sport.setCurrentIndex(0) if self.form_sport.count() > 0 else self.form_sport.setCurrentText("")
         self.form_tournament.setCurrentText("")
+        self.form_provider.setCurrentText("")
         self.form_matchup_team_a.setCurrentText("")
         self.form_matchup_team_b.setCurrentText("")
         self.form_bet.clear()
@@ -1622,6 +2345,7 @@ class MainWindow(QMainWindow):
         """Validate and save / update a bet."""
         sport = self.form_sport.currentText().strip()
         tournament = self.form_tournament.currentText().strip()
+        provider = self.form_provider.currentText().strip()
         team_a = self.form_matchup_team_a.currentText().strip()
         team_b = self.form_matchup_team_b.currentText().strip()
         matchup = f"{team_a} vs {team_b}" if team_a and team_b else (team_a or team_b)
@@ -1638,6 +2362,8 @@ class MainWindow(QMainWindow):
             errors.append("Sport is required.")
         if not tournament:
             errors.append("Tournament is required.")
+        if not provider:
+            errors.append("Provider is required.")
         if not matchup:
             errors.append("Matchup is required.")
         if not bet:
@@ -1690,18 +2416,23 @@ class MainWindow(QMainWindow):
         # --- Save ---
         try:
             if self.editing_bet_id is not None:
+                editing_source_tab = getattr(self, "editing_bet_source_tab", 0)
                 # If result is still Pending -> update editable fields only
                 if is_pending:
                     # Build a fields dict to patch
                     fields: Dict[str, object] = {
                         "sport": sport,
                         "tournament": tournament,
+                        "provider": provider,
                         "matchup": matchup,
                         "bet": bet,
                         "live_status": live_status,
                         "odds": float(odds) if odds is not None else None,
                         "bet_amount": float(bet_amount) if bet_amount is not None else None,
                     }
+                    if editing_source_tab == 1:
+                        fields["result"] = ""
+                        fields["profit"] = 0.0
                     # Remove None values
                     fields = {k: v for k, v in fields.items() if v is not None}
                     self.db.update_bet_fields(self.editing_bet_id, fields)
@@ -1709,6 +2440,9 @@ class MainWindow(QMainWindow):
                     self._reset_form_to_add_mode()
                     self.refresh_data(force=True)
                     self.show_pending_bets_panel()
+                    if editing_source_tab == 1 and hasattr(self, "pending_tabs"):
+                        self.pending_tabs.setCurrentIndex(1)
+                        self.refresh_settled_bets_table()
                 else:
                     # Settling the bet (set result & profit)
                     self.db.update_bet(self.editing_bet_id, result, profit)  # type: ignore[arg-type]
@@ -1716,6 +2450,9 @@ class MainWindow(QMainWindow):
                     self._reset_form_to_add_mode()
                     self.refresh_data(force=True)
                     self.show_pending_bets_panel()
+                    if editing_source_tab == 1 and hasattr(self, "pending_tabs"):
+                        self.pending_tabs.setCurrentIndex(1)
+                        self.refresh_settled_bets_table()
             else:
                 self.db.insert_bet(
                     sport=sport,
@@ -1723,6 +2460,7 @@ class MainWindow(QMainWindow):
                     matchup=matchup,
                     bet=bet,
                     live_status=live_status,
+                    provider=provider,
                     odds=odds,  # type: ignore[arg-type]
                     bet_amount=bet_amount,
                     result=result,
@@ -1739,153 +2477,105 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Pending Bets Panel
     # ------------------------------------------------------------------
-    def _build_pending_bets_panel(self, parent_layout):
-        """Build the pending-bets view with a scroll area of cards and settle buttons."""
-        self.pending_bets_panel = QWidget()
-        p_layout = QVBoxLayout(self.pending_bets_panel)
-        p_layout.setContentsMargins(10, 10, 10, 10)
-
-        self.lbl_pending_count = QLabel("0 pending bet(s)")
-        self.lbl_pending_count.setStyleSheet("font-size: 15px; font-weight: bold;")
-        p_layout.addWidget(self.lbl_pending_count)
-
-        self.pending_scroll = QScrollArea()
-        self.pending_scroll.setWidgetResizable(True)
-        self.pending_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.pending_scroll.setStyleSheet("QScrollArea { border: none; }")
-        
-        self.pending_cards_container = QWidget()
-        self.pending_cards_layout = QGridLayout(self.pending_cards_container)
-        self.pending_cards_layout.setSpacing(10)
-        self.pending_cards_layout.setContentsMargins(0, 0, 0, 0)
-        # Give column 0 and 1 equal width stretch
-        self.pending_cards_layout.setColumnStretch(0, 1)
-        self.pending_cards_layout.setColumnStretch(1, 1)
-        # We will track row inside the loop
-        
-        self.pending_scroll.setWidget(self.pending_cards_container)
-        p_layout.addWidget(self.pending_scroll, 1)
-
-        parent_layout.addWidget(self.pending_bets_panel, 1)
-        self.pending_bets_panel.hide()
-
-    def show_pending_bets_panel(self):
-        """Switch to the pending-bets view."""
-        self.current_view = "pending_bets"
-        self._update_nav_buttons(self.btn_pending_bets)
-        self.table.hide()
-        self.statistics_panel.hide()
-        self.add_bet_panel.hide()
-        self.pending_bets_panel.show()
-        self.refresh_pending_bets_table()
-
-    def refresh_pending_bets_table(self):
-        """Fetch and display pending bets as cards."""
+    def _format_bet_date(self, date_value: str) -> str:
+        if not date_value:
+            return "N/A"
         try:
-            rows = self.db.fetch_pending_bets()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load pending bets:\n{e}")
-            return
-        
-        self.lbl_pending_count.setText(f"{len(rows)} pending bet(s)")
-        
-        # Clear existing cards
-        while self.pending_cards_layout.count():
-            item = self.pending_cards_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-                
-        # To push items to top
-        self.pending_cards_layout.setRowStretch(len(rows) // 2 + 1, 1)
+            dt = datetime.fromisoformat(str(date_value).replace("Z", "+00:00"))
+            return dt.strftime("%d.%m.%Y, %H:%M")
+        except ValueError:
+            return str(date_value)
 
-        for idx, row in enumerate(rows):
-            # row: (id, sport, tournament, matchup, bet,
-            #        live_status, odds, bet_amount, result, profit, date_created)
-            card = QFrame()
-            card.setObjectName("MainCard")
-            is_dark = self.dark_mode
-            bg_col = "#313244" if is_dark else "#e5e9f0"
-            inner_bg_col = "#45475a" if is_dark else "#bcc0cc"
-            border_col = "#45475a" if is_dark else "#bcc0cc"
-            text_col = "#cdd6f4" if is_dark else "#4c4f69"
-            
-            card.setStyleSheet(f"""
-                QFrame#MainCard {{
-                    background-color: {bg_col};
-                    border: 1px solid {border_col};
-                    border-radius: 8px;
-                    padding: 8px;
-                }}
-                QLabel {{ border: none; color: {text_col}; background: transparent; }}
-                QFrame#InnerCard {{
-                    background-color: {inner_bg_col};
-                    border-radius: 6px;
-                    padding: 4px;
-                    border: none;
-                }}
-            """)
-            
-            c_layout = QVBoxLayout(card)
-            c_layout.setContentsMargins(10, 10, 10, 10)
-            c_layout.setSpacing(6)
-            
-            def make_wrap_label(text):
-                lbl = QLabel(text)
-                lbl.setWordWrap(True)
-                return lbl
-            
-            # Format Date
-            date_str = row[10]
-            if date_str:
-                try:
-                    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    date_str = dt.strftime("%d.%m.%Y, %H:%M")
-                except ValueError:
-                    pass
-            
-            # Header: Date & Status
-            h_row = QHBoxLayout()
-            lbl_date = QLabel(f"<b>Date:</b> {date_str or 'N/A'}")
-            lbl_status = QLabel(f"<b>Status:</b> {row[5]}")
-            h_row.addWidget(lbl_date)
-            h_row.addStretch(1)
-            h_row.addWidget(lbl_status)
-            c_layout.addLayout(h_row)
-            
-            # Inner Container for Sport, Tournament, Matchup
-            inner_card = QFrame()
-            inner_card.setObjectName("InnerCard")
-            inner_layout = QVBoxLayout(inner_card)
-            inner_layout.setContentsMargins(6, 6, 6, 6)
-            inner_layout.setSpacing(4)
-            
-            lbl_sport = make_wrap_label(f"<b>Sport:</b> {row[1]}")
-            lbl_tourney = make_wrap_label(f"<b>Tournament:</b> {row[2]}")
-            lbl_matchup = make_wrap_label(f"{row[3]}")
-            
-            inner_layout.addWidget(lbl_sport)
-            inner_layout.addWidget(lbl_tourney)
-            inner_layout.addWidget(lbl_matchup)
-            
-            c_layout.addWidget(inner_card)
-            
-            lbl_bet = make_wrap_label(f"<b>{row[4]}</b>")
-            lbl_bet.setStyleSheet(f"font-size: 15px; color: {text_col}; background: transparent;")
-            c_layout.addWidget(lbl_bet)
-            
-            # Odds & Amount
-            bet_row = QHBoxLayout()
-            lbl_odds = make_wrap_label(f"<b>Odds:</b> {row[6]:.2f}" if row[6] else "<b>Odds:</b> N/A")
-            lbl_amount = make_wrap_label(f"<b>Amount:</b> {row[7]:.2f}" if row[7] else "<b>Amount:</b> N/A")
+    def _create_bet_card(self, row, show_actions: bool = True):
+        card = QFrame()
+        card.setObjectName("MainCard")
+        is_dark = self.dark_mode
+        bg_col = "#313244" if is_dark else "#e5e9f0"
+        inner_bg_col = "#45475a" if is_dark else "#bcc0cc"
+        border_col = "#45475a" if is_dark else "#bcc0cc"
+        text_col = "#cdd6f4" if is_dark else "#4c4f69"
+
+        card.setStyleSheet(f"""
+            QFrame#MainCard {{
+                background-color: {bg_col};
+                border: 1px solid {border_col};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+            QLabel {{ border: none; color: {text_col}; background: transparent; }}
+            QFrame#InnerCard {{
+                background-color: {inner_bg_col};
+                border-radius: 6px;
+                padding: 4px;
+                border: none;
+            }}
+        """)
+
+        c_layout = QVBoxLayout(card)
+        c_layout.setContentsMargins(10, 10, 10, 10)
+        c_layout.setSpacing(6)
+
+        def make_wrap_label(text):
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            return lbl
+
+        date_str = self._format_bet_date(row[10] if len(row) > 10 else "")
+        result_text = str(row[8]) if len(row) > 8 and row[8] else "Pending"
+
+        h_row = QHBoxLayout()
+        lbl_date = QLabel(f"<b>Date:</b> {date_str}")
+        status_label = "Result" if not show_actions else "Status"
+        lbl_status = QLabel(f"<b>{status_label}:</b> {result_text}")
+        h_row.addWidget(lbl_date)
+        h_row.addStretch(1)
+        h_row.addWidget(lbl_status)
+        c_layout.addLayout(h_row)
+
+        inner_card = QFrame()
+        inner_card.setObjectName("InnerCard")
+        inner_layout = QVBoxLayout(inner_card)
+        inner_layout.setContentsMargins(6, 6, 6, 6)
+        inner_layout.setSpacing(4)
+
+        lbl_sport = make_wrap_label(f"<b>Sport:</b> {row[1] if len(row) > 1 else ''}")
+        lbl_tourney = make_wrap_label(f"<b>Tournament:</b> {row[2] if len(row) > 2 else ''}")
+        lbl_provider = make_wrap_label(f"<b>Provider:</b> {row[11] if len(row) > 11 and row[11] else 'Unspecified'}")
+        lbl_matchup = make_wrap_label(f"{row[3] if len(row) > 3 else ''}")
+
+        inner_layout.addWidget(lbl_sport)
+        inner_layout.addWidget(lbl_tourney)
+        inner_layout.addWidget(lbl_provider)
+        inner_layout.addWidget(lbl_matchup)
+
+        c_layout.addWidget(inner_card)
+
+        lbl_bet = make_wrap_label(f"<b>{row[4] if len(row) > 4 else ''}</b>")
+        lbl_bet.setStyleSheet(f"font-size: 15px; color: {text_col}; background: transparent;")
+        c_layout.addWidget(lbl_bet)
+
+        bet_row = QHBoxLayout()
+        odds_value = float(row[6] or 0.0) if len(row) > 6 else 0.0
+        amount_value = float(row[7] or 0.0) if len(row) > 7 else 0.0
+        profit_value = float(row[9] or 0.0) if len(row) > 9 else 0.0
+        lbl_odds = make_wrap_label(f"<b>Odds:</b> {odds_value:.2f}" if odds_value else "<b>Odds:</b> N/A")
+        if show_actions:
+            lbl_amount = make_wrap_label(f"<b>Amount:</b> {amount_value:.2f}" if amount_value else "<b>Amount:</b> N/A")
             bet_row.addWidget(lbl_odds)
             bet_row.addWidget(lbl_amount)
-            bet_row.addStretch(1)
-            c_layout.addLayout(bet_row)
-            
-            # Action Buttons
+        else:
+            lbl_amount = make_wrap_label(f"<b>Amount:</b> {amount_value:.2f}" if amount_value else "<b>Amount:</b> N/A")
+            lbl_profit = make_wrap_label(f"<b>Profit:</b> {profit_value:.2f}" if profit_value or profit_value == 0 else "<b>Profit:</b> N/A")
+            bet_row.addWidget(lbl_odds)
+            bet_row.addWidget(lbl_amount)
+            bet_row.addWidget(lbl_profit)
+        bet_row.addStretch(1)
+        c_layout.addLayout(bet_row)
+
+        if show_actions:
             btn_row = QHBoxLayout()
             btn_row.addStretch(1)
-            
+
             btn_edit = QPushButton("Edit")
             btn_edit.setMinimumWidth(60)
             btn_edit.setStyleSheet(
@@ -1901,19 +2591,241 @@ class MainWindow(QMainWindow):
                 "QPushButton:hover { background-color: #74a8f7; }"
             )
             btn_settle.clicked.connect(lambda checked, b=row: self._settle_bet(b))
-            
+
             btn_row.addWidget(btn_edit)
             btn_row.addWidget(btn_settle)
             c_layout.addLayout(btn_row)
-            
+
+        return card
+
+    def _populate_bet_cards_layout(self, layout, rows, show_actions: bool = True):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        layout.setRowStretch(len(rows) // 2 + 1, 1)
+
+        for idx, row in enumerate(rows):
+            card = self._create_bet_card(row, show_actions=show_actions)
             row_idx = idx // 2
             col_idx = idx % 2
-            self.pending_cards_layout.addWidget(card, row_idx, col_idx)
+            layout.addWidget(card, row_idx, col_idx)
+
+    def _load_settled_history_rows(self):
+        try:
+            rows = [row for row in self.db.fetch_all_bets() if len(row) > 8 and row[8]]
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load settled bets:\n{e}")
+            return []
+
+        rows.sort(key=lambda row: row[10] if len(row) > 10 else "", reverse=True)
+        return rows
+
+    def _update_settled_history_view(self):
+        rows = getattr(self, "settled_history_rows", [])
+        if not hasattr(self, "settled_history_table"):
+            return
+
+        total_rows = len(rows)
+        rows_per_page = 10
+        total_pages = max(1, (total_rows + rows_per_page - 1) // rows_per_page)
+        self.settled_history_page_index = max(0, min(getattr(self, "settled_history_page_index", 0), total_pages - 1))
+
+        start = self.settled_history_page_index * rows_per_page
+        end = min(start + rows_per_page, total_rows)
+        page_rows = rows[start:end]
+
+        self.lbl_settled_count.setText(f"{total_rows} settled bet(s)")
+        self.lbl_settled_page.setText(f"Showing {start + 1 if total_rows else 0}-{end} of {total_rows}")
+        self.btn_settled_prev.setEnabled(self.settled_history_page_index > 0)
+        self.btn_settled_next.setEnabled(self.settled_history_page_index < total_pages - 1)
+
+        self.settled_history_table.blockSignals(True)
+        self.settled_history_table.setRowCount(len(page_rows))
+
+        headers = ["Date", "Sport", "Tournament", "Matchup", "Bet", "Live", "Provider", "Odds", "Result", "Profit"]
+        for row_idx, row in enumerate(page_rows):
+            values = [
+                self._format_bet_date(row[10] if len(row) > 10 else ""),
+                str(row[1] if len(row) > 1 else ""),
+                str(row[2] if len(row) > 2 else ""),
+                str(row[3] if len(row) > 3 else ""),
+                str(row[4] if len(row) > 4 else ""),
+                str(row[5] if len(row) > 5 else ""),
+                str(row[11] if len(row) > 11 and row[11] else "Unspecified"),
+                f"{float(row[6] or 0.0):.2f}" if len(row) > 6 else "N/A",
+                str(row[8] if len(row) > 8 else ""),
+                f"{float(row[9] or 0.0):.2f}" if len(row) > 9 else "0.00",
+            ]
+            for col_idx, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col_idx in (7, 9):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.settled_history_table.setItem(row_idx, col_idx, item)
+
+        self.settled_history_table.blockSignals(False)
+        self.settled_history_table.resizeRowsToContents()
+        self._sync_history_edit_button_state()
+
+    def _build_pending_bets_panel(self, parent_layout):
+        """Build the pending-bets view with a scroll area of cards and settle buttons."""
+        self.pending_bets_panel = QWidget()
+        p_layout = QVBoxLayout(self.pending_bets_panel)
+        p_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.pending_tabs = QTabWidget()
+        self.pending_tabs.currentChanged.connect(self._refresh_pending_bets_tab)
+
+        pending_page = QWidget()
+        pending_page_layout = QVBoxLayout(pending_page)
+        pending_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.lbl_pending_count = QLabel("0 pending bet(s)")
+        self.lbl_pending_count.setStyleSheet("font-size: 15px; font-weight: bold;")
+        pending_page_layout.addWidget(self.lbl_pending_count)
+
+        self.pending_scroll = QScrollArea()
+        self.pending_scroll.setWidgetResizable(True)
+        self.pending_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pending_scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        self.pending_cards_container = QWidget()
+        self.pending_cards_layout = QGridLayout(self.pending_cards_container)
+        self.pending_cards_layout.setSpacing(10)
+        self.pending_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.pending_cards_layout.setColumnStretch(0, 1)
+        self.pending_cards_layout.setColumnStretch(1, 1)
+
+        self.pending_scroll.setWidget(self.pending_cards_container)
+        pending_page_layout.addWidget(self.pending_scroll, 1)
+
+        self.settled_page = QWidget()
+        settled_page_layout = QVBoxLayout(self.settled_page)
+        settled_page_layout.setContentsMargins(0, 0, 0, 0)
+        settled_page_layout.setSpacing(8)
+
+        settled_header = QHBoxLayout()
+        self.lbl_settled_count = QLabel("0 settled bet(s)")
+        self.lbl_settled_count.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.lbl_settled_page = QLabel("Showing 0-0 of 0")
+        self.lbl_settled_page.setStyleSheet("font-size: 13px; color: #8b90a0;")
+        settled_header.addWidget(self.lbl_settled_count)
+        settled_header.addStretch(1)
+        settled_header.addWidget(self.lbl_settled_page)
+        settled_page_layout.addLayout(settled_header)
+
+        settled_nav = QHBoxLayout()
+        self.btn_settled_prev = QPushButton("Previous 10")
+        self.btn_settled_prev.clicked.connect(lambda checked=False: self._change_settled_history_page(-1))
+        self.btn_settled_next = QPushButton("Next 10")
+        self.btn_settled_next.clicked.connect(lambda checked=False: self._change_settled_history_page(1))
+        settled_nav.addWidget(self.btn_settled_prev)
+        settled_nav.addWidget(self.btn_settled_next)
+        self.btn_settled_edit = QPushButton("Edit Selected")
+        self.btn_settled_edit.setEnabled(False)
+        self.btn_settled_edit.clicked.connect(self._edit_selected_history_bet)
+        settled_nav.addWidget(self.btn_settled_edit)
+        settled_nav.addStretch(1)
+        settled_page_layout.addLayout(settled_nav)
+
+        self.settled_history_table = QTableWidget(0, 10)
+        self.settled_history_table.setHorizontalHeaderLabels(["Date", "Sport", "Tournament", "Matchup", "Bet", "Live", "Provider", "Odds", "Result", "Profit"])
+        self.settled_history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.settled_history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.settled_history_table.setAlternatingRowColors(True)
+        self.settled_history_table.verticalHeader().setVisible(False)
+        self.settled_history_table.setShowGrid(False)
+        self.settled_history_table.setWordWrap(True)
+        self.settled_history_table.cellDoubleClicked.connect(self._edit_selected_history_bet)
+        self.settled_history_table.itemSelectionChanged.connect(self._sync_history_edit_button_state)
+        history_header = self.settled_history_table.horizontalHeader()
+        history_header.setStretchLastSection(False)
+        history_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
+        settled_page_layout.addWidget(self.settled_history_table, 1)
+
+        self.pending_tabs.addTab(pending_page, "Pending Bets")
+        self.pending_tabs.addTab(self.settled_page, "History")
+        p_layout.addWidget(self.pending_tabs, 1)
+
+        parent_layout.addWidget(self.pending_bets_panel, 1)
+        self.pending_bets_panel.hide()
+
+    def _refresh_pending_bets_tab(self, index: int):
+        if index == 1:
+            self.refresh_settled_bets_table()
+        else:
+            self.refresh_pending_bets_table()
+
+    def _change_settled_history_page(self, delta: int):
+        self.settled_history_page_index = max(0, getattr(self, "settled_history_page_index", 0) + delta)
+        self._update_settled_history_view()
+
+    def _sync_history_edit_button_state(self):
+        if hasattr(self, "btn_settled_edit") and hasattr(self, "settled_history_table"):
+            self.btn_settled_edit.setEnabled(self.settled_history_table.currentRow() >= 0)
+
+    def _edit_selected_history_bet(self, *args):
+        if not hasattr(self, "settled_history_table"):
+            return
+
+        table_row = self.settled_history_table.currentRow()
+        if table_row < 0:
+            return
+
+        rows = getattr(self, "settled_history_rows", [])
+        page_index = getattr(self, "settled_history_page_index", 0)
+        source_index = page_index * 10 + table_row
+        if source_index < 0 or source_index >= len(rows):
+            return
+
+        self._edit_bet(rows[source_index], source_tab=1, preserve_result=True)
+
+    def show_pending_bets_panel(self):
+        """Switch to the pending-bets view."""
+        self.current_view = "pending_bets"
+        self._update_nav_buttons(self.btn_pending_bets)
+        self.table.hide()
+        self.statistics_panel.hide()
+        self.add_bet_panel.hide()
+        self.pending_bets_panel.show()
+        if hasattr(self, "pending_tabs"):
+            self.pending_tabs.setCurrentIndex(0)
+        self.settled_history_page_index = 0
+        self.refresh_pending_bets_table()
+        self.refresh_settled_bets_table()
+
+    def refresh_pending_bets_table(self):
+        """Fetch and display pending bets as cards."""
+        try:
+            rows = self.db.fetch_pending_bets()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load pending bets:\n{e}")
+            return
+        
+        self.lbl_pending_count.setText(f"{len(rows)} pending bet(s)")
+        self._populate_bet_cards_layout(self.pending_cards_layout, rows, show_actions=True)
+
+    def refresh_settled_bets_table(self):
+        """Fetch and display settled bets as a paginated line list."""
+        self.settled_history_rows = self._load_settled_history_rows()
+        if not hasattr(self, "settled_history_page_index"):
+            self.settled_history_page_index = 0
+        self._update_settled_history_view()
 
     def _settle_bet(self, row_data):
         """Open a small dialog to quickly settle a pending bet (Win / Lose)."""
         # row_data: (id, sport, tournament, matchup, bet,
-        #            live_status, odds, bet_amount, result, profit, date_created)
+        #            live_status, odds, bet_amount, result, profit, date_created, provider)
         bid = row_data[0]
         sport = str(row_data[1])
         tournament = str(row_data[2])
@@ -1932,6 +2844,7 @@ class MainWindow(QMainWindow):
         info = QLabel(
             f"<b>Sport:</b> {sport}<br>"
             f"<b>Tournament:</b> {tournament}<br>"
+            f"<b>Provider:</b> {str(row_data[11] if len(row_data) > 11 and row_data[11] else 'Unspecified')}<br>"
             f"<b>Matchup:</b> {matchup}<br>"
             f"<b>Bet:</b> {bet_text}<br>"
             f"<b>Odds:</b> {odds:.2f}   <b>Amount:</b> {amount_str}"
@@ -1946,7 +2859,9 @@ class MainWindow(QMainWindow):
         btn_win.setStyleSheet("QPushButton { background-color: #2ecc71; color: white; font-weight: bold; padding: 6px 18px; border-radius: 6px; }")
         btn_lose = QPushButton("Lose")
         btn_lose.setStyleSheet("QPushButton { background-color: #e74c3c; color: white; font-weight: bold; padding: 6px 18px; border-radius: 6px; }")
-        btn_cancel = QPushButton("Cancel")
+        btn_void = QPushButton("Delete Bet")
+        btn_void.setStyleSheet("QPushButton { background-color: #f39c12; color: white; font-weight: bold; padding: 6px 18px; border-radius: 6px; }")
+        btn_cancel = QPushButton("Close")
         btn_cancel.setStyleSheet("QPushButton { padding: 6px 12px; }")
 
         def ensure_amount() -> Optional[float]:
@@ -1979,22 +2894,36 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to settle bet:\n{e}")
 
+        def do_delete():
+            # Delete the bet completely
+            try:
+                self.db.delete_bet(bid)
+                QMessageBox.information(self, "Success", "Bet has been removed.")
+                dlg.accept()
+                self.refresh_data(force=True)
+                self.show_pending_bets_panel()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to remove bet:\n{e}")
+
         btn_win.clicked.connect(lambda checked: do_settle(True))
         btn_lose.clicked.connect(lambda checked: do_settle(False))
+        btn_void.clicked.connect(lambda checked: do_delete())
         btn_cancel.clicked.connect(dlg.reject)
 
         btn_row.addWidget(btn_win)
         btn_row.addWidget(btn_lose)
+        btn_row.addWidget(btn_void)
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
 
         dlg.exec()
 
-    def _edit_pending_bet(self, row_data):
-        """Open the add-bet form in editable mode for a pending bet (allow changing sport, matchup, odds, etc.)."""
+    def _edit_bet(self, row_data, source_tab: int = 0, preserve_result: bool = False):
+        """Open the add-bet form in editable mode for a bet row."""
         # row_data: (id, sport, tournament, matchup, bet,
-        #            live_status, odds, bet_amount, result, profit, date_created)
+        #            live_status, odds, bet_amount, result, profit, date_created, provider)
         self.editing_bet_id = row_data[0]
+        self.editing_bet_source_tab = source_tab
         self.current_view = "add_bet"
         self._update_nav_buttons(self.btn_add_bet)
         self.table.hide()
@@ -2002,14 +2931,17 @@ class MainWindow(QMainWindow):
         self.pending_bets_panel.hide()
         self.add_bet_panel.show()
 
-        self.add_bet_title.setText("Edit Pending Bet")
+        self.add_bet_title.setText("Edit Bet")
         self.btn_save_bet.setText("Update Bet")
 
         self._populate_form_sports()
+        self._populate_form_providers()
 
         # Fill fields (keep all editable)
         self.form_sport.setCurrentText(str(row_data[1]))
         self.form_tournament.setCurrentText(str(row_data[2]))
+        if len(row_data) > 11:
+            self.form_provider.setCurrentText(str(row_data[11]))
         
         matchup_str = str(row_data[3])
         team_a, team_b = "", ""
@@ -2030,18 +2962,30 @@ class MainWindow(QMainWindow):
             self.form_live_status.setCurrentIndex(idx)
         self.form_odds.setText(f"{row_data[6]:.2f}" if row_data[6] else "")
         self.form_bet_amount.setText(f"{row_data[7]:.2f}" if row_data[7] else "")
-        self.form_result.setCurrentIndex(0)  # keep as Pending
-        self.form_profit.clear()
+        if preserve_result and len(row_data) > 8 and row_data[8]:
+            result_text = str(row_data[8])
+            result_index = self.form_result.findText(result_text)
+            if result_index >= 0:
+                self.form_result.setCurrentIndex(result_index)
+            else:
+                self.form_result.setCurrentIndex(0)
+            self.form_profit.setText(f"{row_data[9]:.2f}" if len(row_data) > 9 and row_data[9] is not None else "")
+        else:
+            self.form_result.setCurrentIndex(0)  # keep as Pending
+            self.form_profit.clear()
 
         # Ensure fields are enabled for editing
         for w in [self.form_sport, self.form_tournament, 
-                  self.form_matchup_team_a, self.form_matchup_team_b,
+                self.form_provider, self.form_matchup_team_a, self.form_matchup_team_b,
                   self.form_bet, self.form_live_status,
                   self.form_odds, self.form_bet_amount]:
             w.setEnabled(True)
 
         self.form_result.setEnabled(True)
         self.form_profit.setReadOnly(True)
+
+    def _edit_pending_bet(self, row_data):
+        self._edit_bet(row_data, source_tab=0, preserve_result=False)
 
     def dismiss_changes_panel(self):
         """Hide the changes notification panel"""
@@ -2288,10 +3232,13 @@ class MainWindow(QMainWindow):
             self.sport_combo.setCurrentText(first)
             self._populate_tournament_combo(first)
             self._populate_team_combo(first)
+            self._populate_provider_combo(first)
             self._apply_filters()
 
     def set_matchbet_data(self, data: List[MatchBetTuple]):
         self.matchbet_data = data
+        if hasattr(self, "sport_combo"):
+            self._populate_provider_combo(self.sport_combo.currentText())
 
 
 def main():

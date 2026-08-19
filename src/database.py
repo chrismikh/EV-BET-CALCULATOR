@@ -106,6 +106,7 @@ class DatabaseManager:
         matchup: str,
         bet: str,
         live_status: str,
+        provider: str,
         odds: float,
         bet_amount: Optional[float] = None,
         result: Optional[str] = None,
@@ -123,6 +124,7 @@ class DatabaseManager:
             "matchup": matchup,
             "bet": bet,
             "live_status": live_status,
+            "provider": provider,
             "odds": odds,
             "bet_amount": bet_amount,
             "result": result,
@@ -251,12 +253,13 @@ class DatabaseManager:
                 d.get("bet_amount", 0.0),
                 d.get("result", ""),
                 d.get("profit", 0.0),
-                d.get("date_created", "")
+                d.get("date_created", ""),
+                d.get("provider", "")
             )
             for d in docs
         ]
 
-    def fetch_settled_bets(self, force_refresh: bool = False) -> List[Tuple[str, str, str, str, str, float, str]]:
+    def fetch_settled_bets(self, force_refresh: bool = False) -> List[Tuple[str, str, str, str, str, float, str, str]]:
         docs = self._fetch_docs_as_dicts(force_refresh=force_refresh)
         settled = [d for d in docs if d.get("result")]
         settled.sort(key=lambda x: x.get("date_created", ""))
@@ -269,7 +272,8 @@ class DatabaseManager:
                 d.get("bet", ""),
                 d.get("live_status", ""),
                 float(d.get("odds", 0.0)),
-                d.get("result", "")
+                d.get("result", ""),
+                d.get("provider", "")
             )
             for d in settled
         ]
@@ -292,15 +296,30 @@ class DatabaseManager:
                 d.get("bet_amount", 0.0),
                 d.get("result", ""),
                 d.get("profit", 0.0),
-                d.get("date_created", "")
+                d.get("date_created", ""),
+                d.get("provider", "")
             )
             for d in pending
         ]
+
+    def get_distinct_providers(self) -> List[str]:
+        docs = self._fetch_docs_as_dicts()
+        providers = {d.get("provider", "") for d in docs if str(d.get("provider", "")).strip()}
+        return sorted(list(providers))
 
     def get_distinct_sports(self) -> List[str]:
         docs = self._fetch_docs_as_dicts()
         sports = {d.get("sport", "") for d in docs if d.get("sport")}
         return sorted(list(sports))
+
+    def delete_bet(self, bet_id: str) -> None:
+        """Delete a single bet by ID."""
+        url = self.auth.get_bets_url(bet_id)
+        self._request_with_backoff("DELETE", url)
+        
+        # Update cache directly
+        if self._cached_docs is not None:
+            self._cached_docs = [doc for doc in self._cached_docs if doc.get("id") != bet_id]
 
     def delete_all_bets(self) -> int:
         docs = self._fetch_docs_as_dicts(force_refresh=True)
